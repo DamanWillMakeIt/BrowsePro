@@ -1,21 +1,36 @@
-# Python 3.11 + Playwright deps pre-installed
-FROM mcr.microsoft.com/playwright/python:v1.58.0-jammy
-
-# Reinstall Python 3.11 since base image ships 3.10
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3.11 \
-    python3.11-dev \
-    python3.11-distutils \
-    python3-pip \
-    ffmpeg \
-    && rm -rf /var/lib/apt/lists/* \
-    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
-    && update-alternatives --install /usr/bin/python python python3.11 1
+# Python 3.11 slim base — browser-use requires 3.11+
+FROM python:3.11-slim-bookworm
 
 # Environment
 ENV PYTHONUNBUFFERED=1
 ENV PYTHONDONTWRITEBYTECODE=1
 WORKDIR /app
+
+# Install system deps: ffmpeg + Playwright OS dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ffmpeg \
+    # Playwright/Chromium OS deps
+    libnss3 \
+    libnspr4 \
+    libatk1.0-0 \
+    libatk-bridge2.0-0 \
+    libcups2 \
+    libdrm2 \
+    libdbus-1-3 \
+    libxkbcommon0 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxfixes3 \
+    libxrandr2 \
+    libgbm1 \
+    libasound2 \
+    libpango-1.0-0 \
+    libcairo2 \
+    libatspi2.0-0 \
+    libwayland-client0 \
+    wget \
+    ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
 
 # Install uv
 RUN pip install uv
@@ -24,8 +39,8 @@ RUN pip install uv
 COPY requirements.txt .
 RUN uv pip install --system --no-cache -r requirements.txt
 
-# Install Chromium browser
-RUN playwright install chromium
+# Install Playwright + Chromium
+RUN playwright install chromium --with-deps
 
 # Copy app
 COPY . .
