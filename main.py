@@ -50,12 +50,9 @@ os.makedirs(SCAN_DIR, exist_ok=True)
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
 
 # ---------------------------------------------------------------------------
-# RESIDENTIAL PROXY POOL — rotate per session for max stealth
-# Load from env vars (PROXY_1..PROXY_N) or fall back to hardcoded list.
-# Format: host:port:user:pass
+# RESIDENTIAL PROXY POOL — single source of truth, no duplicates
 # ---------------------------------------------------------------------------
-
-_PROXY_LIST_DEFAULT = [
+PROXY_POOL = [
     {"host": os.getenv("PROXY_1_HOST", "104.252.62.99"),  "port": os.getenv("PROXY_1_PORT", "5470"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
     {"host": os.getenv("PROXY_2_HOST", "45.248.55.14"),   "port": os.getenv("PROXY_2_PORT", "6600"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
     {"host": os.getenv("PROXY_3_HOST", "103.130.178.57"), "port": os.getenv("PROXY_3_PORT", "5721"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
@@ -63,97 +60,22 @@ _PROXY_LIST_DEFAULT = [
     {"host": os.getenv("PROXY_5_HOST", "192.46.188.160"), "port": os.getenv("PROXY_5_PORT", "5819"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
 ]
 
-_proxy_index = 0
-_proxy_lock  = asyncio.Lock()
-
-async def _get_next_proxy() -> dict:
-    """Round-robin proxy rotation — picks a different proxy each session."""
-    global _proxy_index
-    async with _proxy_lock:
-        proxy = _PROXY_LIST_DEFAULT[_proxy_index % len(_PROXY_LIST_DEFAULT)]
-        _proxy_index += 1
-        return proxy
-
-def _proxy_server_url(proxy: dict) -> str:
-    """Returns http://user:pass@host:port format for Playwright."""
-    return f"http://{proxy['user']}:{proxy['pass']}@{proxy['host']}:{proxy['port']}"
-
-def _capsolver_proxy_config(proxy: dict) -> dict:
-    """Returns CapSolver proxy fields for non-ProxyLess task types."""
-    return {
-        "proxyType": "http",
-        "proxyAddress": proxy["host"],
-        "proxyPort":    int(proxy["port"]),
-        "proxyLogin":   proxy["user"],
-        "proxyPassword": proxy["pass"],
-    }
-
-# ---------------------------------------------------------------------------
-# RESIDENTIAL PROXY POOL — rotates per session
-# ---------------------------------------------------------------------------
-PROXY_POOL = [
-    {"host": "104.252.62.99",  "port": "5470", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
-    {"host": "45.248.55.14",   "port": "6600", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
-    {"host": "103.130.178.57", "port": "5721", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
-    {"host": "82.22.181.141",  "port": "7852", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
-    {"host": "192.46.188.160", "port": "5819", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
-]
-
-_ACTIVE_PROXY: dict = PROXY_POOL[0]  # set per-session in run_agent
-
+# Single active proxy per session — set once in run_agent, shared by browser + CapSolver
+_ACTIVE_PROXY: dict = PROXY_POOL[0]
 
 def _pick_proxy() -> dict:
-    """Pick a random proxy from the pool each session."""
-    p = random.choice(PROXY_POOL)
-    return {
-        "server":   f"http://{p['host']}:{p['port']}",
-        "username": p["user"],
-        "password": p["pass"],
-    }
-
-# ---------------------------------------------------------------------------
-# RESIDENTIAL PROXY POOL
-# ---------------------------------------------------------------------------
-PROXY_POOL = [
-    {"host": "104.252.62.99",  "port": "5470", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
-    {"host": "45.248.55.14",   "port": "6600", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
-    {"host": "103.130.178.57", "port": "5721", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
-    {"host": "82.22.181.141",  "port": "7852", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
-    {"host": "192.46.188.160", "port": "5819", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
-]
-
-_ACTIVE_PROXY: dict = PROXY_POOL[0]  # set per-session in run_agent
-
-
-def _pick_proxy() -> dict:
-    """Pick a random proxy from the pool each session."""
+    """Pick a random proxy from the pool."""
     return random.choice(PROXY_POOL)
 
-def _proxy_url(p: dict) -> str:
-    """Return http://user:pass@host:port string."""
-    return f"http://{p['user']}:{p['pass']}@{p['host']}:{p['port']}"
+def _proxy_server_url(proxy: dict) -> str:
+    """Returns http://user:pass@host:port for Playwright BrowserConfig."""
+    return f"http://{proxy['user']}:{proxy['pass']}@{proxy['host']}:{proxy['port']}"
 
-# Persistent browser profile — reuses cookies/localStorage across sessions
+# Persistent browser profile directory
 PROFILE_DIR = os.path.join(os.getcwd(), "browser_profile")
 os.makedirs(PROFILE_DIR, exist_ok=True)
 
-# Residential proxies — rotated randomly per session
-PROXIES = [
-    {"host": "104.252.62.99",  "port": "5470", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
-    {"host": "45.248.55.14",   "port": "6600", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
-    {"host": "103.130.178.57", "port": "5721", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
-    {"host": "82.22.181.141",  "port": "7852", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
-    {"host": "192.46.188.160", "port": "5819", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
-]
-
-_ACTIVE_PROXY: dict = PROXY_POOL[0]  # set per-session in run_agent
-
-
-def _pick_proxy() -> dict:
-    """Pick a random proxy from the pool each session."""
-    return random.choice(PROXIES)
-
-# playwright-stealth — fixes TLS fingerprint + deeper signals
+# playwright-stealth
 try:
     from playwright_stealth import stealth_async as _stealth_async
     STEALTH_LIB_AVAILABLE = True
@@ -165,9 +87,8 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# STEALTH + CAPTCHA  (new additions — everything below this block is original)
+# STEALTH SCRIPT
 # ---------------------------------------------------------------------------
-
 STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 Object.defineProperty(navigator, 'plugins', { get: () => [
@@ -200,35 +121,34 @@ WebGLRenderingContext.prototype.getParameter = function(p) {
 """
 
 
+# ---------------------------------------------------------------------------
+# CAPTCHA SOLVER
+# ---------------------------------------------------------------------------
+
 async def _capsolver_solve(task: dict, proxy: dict | None = None) -> dict | None:
-    """
-    Solve a CAPTCHA via CapSolver.
-    If a proxy dict is provided, injects it into the task for proxy-based solving
-    (higher success rate than ProxyLess).
-    """
+    """Solve a CAPTCHA via CapSolver using the active session proxy."""
     if not CAPSOLVER_API_KEY:
+        print("[CapSolver] No API key configured — skipping")
         return None
 
-    # Inject proxy into task if provided — upgrades ProxyLess → proxy task type
     if proxy:
-        task["proxyType"] = "http"
-        task["proxyAddress"] = proxy["host"]
-        task["proxyPort"] = int(proxy["port"])
-        task["proxyLogin"] = proxy["user"]
+        task["proxyType"]     = "http"
+        task["proxyAddress"]  = proxy["host"]
+        task["proxyPort"]     = int(proxy["port"])
+        task["proxyLogin"]    = proxy["user"]
         task["proxyPassword"] = proxy["pass"]
-        # Rename ProxyLess task types to proxy-based equivalents
-        task["type"] = task["type"].replace("ProxyLess", "")
+        task["type"]          = task["type"].replace("ProxyLess", "")
 
     try:
         async with httpx.AsyncClient(timeout=30) as c:
-            r = await c.post("https://api.capsolver.com/createTask",
-                             json={"clientKey": CAPSOLVER_API_KEY, "task": task})
+            r    = await c.post("https://api.capsolver.com/createTask",
+                                json={"clientKey": CAPSOLVER_API_KEY, "task": task})
             data = r.json()
             if data.get("errorId") != 0:
                 print(f"[CapSolver] Error: {data.get('errorDescription')}")
                 return None
             task_id = data["taskId"]
-        async with httpx.AsyncClient(timeout=30) as c:
+        async with httpx.AsyncClient(timeout=120) as c:
             for _ in range(60):
                 await asyncio.sleep(2)
                 r = await c.post("https://api.capsolver.com/getTaskResult",
@@ -237,6 +157,7 @@ async def _capsolver_solve(task: dict, proxy: dict | None = None) -> dict | None
                 if d.get("status") == "ready":
                     return d.get("solution", {})
                 if d.get("status") == "failed":
+                    print("[CapSolver] Task failed")
                     return None
     except Exception as exc:
         print(f"[CapSolver] Exception: {exc}")
@@ -253,14 +174,30 @@ async def detect_and_solve_captcha(page) -> None:
                 html = await page.evaluate("() => document.documentElement.outerHTML")
             except Exception:
                 return
-        page_url = await page.evaluate("() => window.location.href")
+
+        # FIX: page.url is a property in some Playwright versions, coroutine in others
+        try:
+            page_url = page.url
+            if asyncio.iscoroutine(page_url):
+                page_url = await page_url
+        except Exception:
+            page_url = await page.evaluate("() => window.location.href")
+
+        proxy = _ACTIVE_PROXY
 
         # ── Cloudflare Turnstile ──────────────────────────────────────────
         ts_key = None
         for frame in page.frames:
-            if "challenges.cloudflare.com" in frame.url or "turnstile" in frame.url.lower():
-                m = _re.search(r'[?&]k=([^&]+)', frame.url)
-                if m: ts_key = m.group(1)
+            try:
+                frame_url = frame.url
+                if asyncio.iscoroutine(frame_url):
+                    frame_url = await frame_url
+            except Exception:
+                frame_url = ""
+            if "challenges.cloudflare.com" in frame_url or "turnstile" in frame_url.lower():
+                m = _re.search(r'[?&]k=([^&]+)', frame_url)
+                if m:
+                    ts_key = m.group(1)
                 break
         if not ts_key:
             m = _re.search(r'data-sitekey=["\']([^"\']+)["\']', html)
@@ -268,10 +205,11 @@ async def detect_and_solve_captcha(page) -> None:
                 ts_key = m.group(1)
         if ts_key:
             print(f"[CAPTCHA] Turnstile detected — solving…")
-            sol = await _capsolver_solve({"type": "AntiTurnstileTask",
-                                          "websiteURL": page_url, "websiteKey": ts_key,
-                                          "proxyType": "http", "proxyAddress": _ACTIVE_PROXY["host"],
-                                          "proxyPort": int(_ACTIVE_PROXY["port"]), "proxyLogin": _ACTIVE_PROXY["user"], "proxyPassword": _ACTIVE_PROXY["pass"]})
+            sol = await _capsolver_solve({
+                "type":       "AntiTurnstileTask",
+                "websiteURL": page_url,
+                "websiteKey": ts_key,
+            }, proxy=proxy)
             if sol:
                 token = sol.get("token", "")
                 await page.evaluate("""(t) => {
@@ -283,7 +221,7 @@ async def detect_and_solve_captcha(page) -> None:
                 print("[CAPTCHA] Turnstile injected ✅")
             return
 
-        # ── Cloudflare JS challenge (no sitekey — wait it out) ────────────
+        # ── Cloudflare JS challenge ───────────────────────────────────────
         if "Just a moment" in html or "cf-browser-verification" in html:
             print("[CAPTCHA] Cloudflare JS challenge — waiting up to 15s…")
             for _ in range(15):
@@ -298,10 +236,16 @@ async def detect_and_solve_captcha(page) -> None:
         # ── reCAPTCHA v2 ─────────────────────────────────────────────────
         rc_key = None
         for frame in page.frames:
-            if "recaptcha" in frame.url and "anchor" in frame.url:
-                m = _re.search(r'[?&]k=([^&]+)', frame.url)
-                if m: rc_key = m.group(1)
-                # Try free checkbox click first
+            try:
+                frame_url = frame.url
+                if asyncio.iscoroutine(frame_url):
+                    frame_url = await frame_url
+            except Exception:
+                frame_url = ""
+            if "recaptcha" in frame_url and "anchor" in frame_url:
+                m = _re.search(r'[?&]k=([^&]+)', frame_url)
+                if m:
+                    rc_key = m.group(1)
                 try:
                     cb = frame.locator(".recaptcha-checkbox-border").first
                     if await cb.count() > 0:
@@ -315,13 +259,15 @@ async def detect_and_solve_captcha(page) -> None:
                 break
         if not rc_key:
             m = _re.search(r'data-sitekey=["\']([^"\']+)["\']', html)
-            if m: rc_key = m.group(1)
+            if m:
+                rc_key = m.group(1)
         if rc_key and "6L" in rc_key:
             print("[CAPTCHA] reCAPTCHA v2 detected — solving…")
-            sol = await _capsolver_solve({"type": "ReCaptchaV2Task",
-                                          "websiteURL": page_url, "websiteKey": rc_key,
-                                          "proxyType": "http", "proxyAddress": _ACTIVE_PROXY["host"],
-                                          "proxyPort": int(_ACTIVE_PROXY["port"]), "proxyLogin": _ACTIVE_PROXY["user"], "proxyPassword": _ACTIVE_PROXY["pass"]})
+            sol = await _capsolver_solve({
+                "type":       "ReCaptchaV2Task",
+                "websiteURL": page_url,
+                "websiteKey": rc_key,
+            }, proxy=proxy)
             if sol:
                 token = sol.get("gRecaptchaResponse", "")
                 await page.evaluate("""(t) => {
@@ -342,10 +288,11 @@ async def detect_and_solve_captcha(page) -> None:
             m = _re.search(r'data-sitekey=["\']([^"\']+)["\']', html)
             if m:
                 print("[CAPTCHA] hCaptcha detected — solving…")
-                sol = await _capsolver_solve({"type": "HCaptchaTask",
-                                              "websiteURL": page_url, "websiteKey": m.group(1),
-                                              "proxyType": "http", "proxyAddress": _ACTIVE_PROXY["host"],
-                                              "proxyPort": int(_ACTIVE_PROXY["port"]), "proxyLogin": _ACTIVE_PROXY["user"], "proxyPassword": _ACTIVE_PROXY["pass"]})
+                sol = await _capsolver_solve({
+                    "type":       "HCaptchaTask",
+                    "websiteURL": page_url,
+                    "websiteKey": m.group(1),
+                }, proxy=proxy)
                 if sol:
                     token = sol.get("gRecaptchaResponse", "")
                     await page.evaluate("""(t) => {
@@ -363,29 +310,19 @@ async def detect_and_solve_captcha(page) -> None:
 
 
 # ---------------------------------------------------------------------------
-# HUMAN-LIKE BEHAVIOUR HELPERS
+# HUMAN-LIKE BEHAVIOUR
 # ---------------------------------------------------------------------------
 
 async def human_delay(min_ms: int = 500, max_ms: int = 2000) -> None:
-    """Random delay to mimic human reaction time between actions."""
     await asyncio.sleep(random.uniform(min_ms / 1000, max_ms / 1000))
 
 
 async def apply_stealth_to_page(page) -> None:
-    """
-    Apply all stealth layers to a Playwright page:
-    1. playwright-stealth library (fixes TLS + deep signals)
-    2. Our custom JS stealth script (navigator, canvas, WebGL)
-    """
-    # Layer 1: playwright-stealth (fixes TLS fingerprint)
     if STEALTH_LIB_AVAILABLE:
         try:
             await _stealth_async(page)
-            print("[Stealth] playwright-stealth applied ✅")
         except Exception as exc:
             print(f"[Stealth] playwright-stealth failed: {exc}")
-
-    # Layer 2: custom JS stealth
     try:
         await page.add_init_script(STEALTH_SCRIPT)
     except Exception:
@@ -409,19 +346,16 @@ class AgentResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Proper placeholder PNG (1920×1080 grey frame via Pillow)
+# Placeholder frame
 # ---------------------------------------------------------------------------
 
 def _ensure_minimum_frames(folder: str) -> None:
-    """Write a proper 1920×1080 placeholder if no PNGs exist yet."""
     if glob.glob(os.path.join(folder, "*.png")):
         return
-
     print("[Frames] No screenshots — writing 1920×1080 placeholder.")
     path = os.path.join(folder, "step_0000_placeholder.png")
-
     try:
-        from PIL import Image, ImageDraw, ImageFont
+        from PIL import Image, ImageDraw
         img  = Image.new("RGB", (1920, 1080), color=(30, 30, 30))
         draw = ImageDraw.Draw(img)
         msg  = "No screenshot captured"
@@ -431,7 +365,6 @@ def _ensure_minimum_frames(folder: str) -> None:
             tw = len(msg) * 8
         draw.text(((1920 - tw) / 2, 520), msg, fill=(180, 180, 180))
         img.save(path, "PNG")
-        print(f"[Frames] Placeholder written → {path}")
     except Exception as exc:
         print(f"[Frames] Pillow placeholder failed ({exc}), writing raw PNG.")
         import struct, zlib
@@ -449,14 +382,10 @@ def _ensure_minimum_frames(folder: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Extract screenshots from AgentHistoryList object
+# Screenshot extractors
 # ---------------------------------------------------------------------------
 
 def _dump_history_screenshots(history, folder: str) -> int:
-    """
-    Walk every ActionResult / AgentHistory object and save embedded
-    base64 screenshots to disk.  Returns number of frames saved.
-    """
     saved = 0
 
     def _save(raw: str, label: str) -> bool:
@@ -473,21 +402,16 @@ def _dump_history_screenshots(history, folder: str) -> int:
             with open(path, "wb") as fh:
                 fh.write(img_bytes)
             saved += 1
-            print(f"[History] Saved screenshot → {path}")
             return True
-        except Exception as exc:
-            print(f"[History] Could not decode {label}: {exc}")
+        except Exception:
             return False
 
     try:
-        results = getattr(history, "all_results", []) or []
-        for i, result in enumerate(results):
+        for i, result in enumerate(getattr(history, "all_results", []) or []):
             for attr in ("screenshot", "base64_screenshot", "image", "screenshot_b64"):
                 if _save(getattr(result, attr, None), f"step_{i+1:04d}_result"):
                     break
-
-        histories = getattr(history, "history", []) or []
-        for i, h in enumerate(histories):
+        for i, h in enumerate(getattr(history, "history", []) or []):
             state = getattr(h, "state", None)
             if state is not None:
                 for attr in ("screenshot", "base64_screenshot", "image", "screenshot_b64"):
@@ -496,43 +420,26 @@ def _dump_history_screenshots(history, folder: str) -> int:
             for attr in ("screenshot", "base64_screenshot", "image", "screenshot_b64"):
                 if _save(getattr(h, attr, None), f"step_{i+1:04d}_h"):
                     break
-
     except Exception as exc:
         print(f"[History] Object extraction failed: {exc}")
 
     return saved
 
 
-# ---------------------------------------------------------------------------
-# Extract screenshots from conversation_*.json files
-# (browser-use 0.11.x saves every step as a JSON with base64 screenshots)
-# ---------------------------------------------------------------------------
-
 def _dump_json_screenshots(folder: str) -> int:
-    """
-    Parse every conversation_*.json in *folder* and extract embedded
-    base64 screenshots.  Returns number of new frames saved.
-    """
     saved   = 0
     pattern = os.path.join(folder, "conversation_*.json")
     files   = sorted(glob.glob(pattern))
-
     if not files:
-        print("[JSON] No conversation_*.json files found.")
         return 0
-
-    print(f"[JSON] Found {len(files)} conversation JSON file(s) — extracting screenshots…")
-
+    print(f"[JSON] Found {len(files)} conversation JSON file(s)")
     for json_path in files:
         try:
             with open(json_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-        except Exception as exc:
-            print(f"[JSON] Could not parse {json_path}: {exc}")
+        except Exception:
             continue
-
         messages = data if isinstance(data, list) else data.get("messages", [])
-
         for msg in messages:
             content = msg.get("content", [])
             if not isinstance(content, list):
@@ -543,15 +450,12 @@ def _dump_json_screenshots(folder: str) -> int:
                 img_url = (block.get("image_url") or {}).get("url", "")
                 source  = block.get("source") or {}
                 raw     = ""
-
                 if img_url.startswith("data:image"):
                     raw = img_url.split(",", 1)[1] if "," in img_url else ""
                 elif source.get("type") == "base64":
                     raw = source.get("data", "")
-
                 if not raw:
                     continue
-
                 try:
                     img_bytes = base64.b64decode(raw)
                     if not (img_bytes[:4] == b'\x89PNG' or img_bytes[:2] == b'\xff\xd8'):
@@ -562,16 +466,14 @@ def _dump_json_screenshots(folder: str) -> int:
                     with open(out, "wb") as fh:
                         fh.write(img_bytes)
                     saved += 1
-                    print(f"[JSON] Extracted screenshot → {out}")
-                except Exception as exc:
-                    print(f"[JSON] Decode error in {json_path}: {exc}")
-
-    print(f"[JSON] Total screenshots extracted from JSON: {saved}")
+                except Exception:
+                    pass
+    print(f"[JSON] Total screenshots extracted: {saved}")
     return saved
 
 
 # ---------------------------------------------------------------------------
-# Prompt wrapper — adds strict tool-adding instructions to any task
+# Prompt wrapper
 # ---------------------------------------------------------------------------
 
 def _wrap_prompt(user_prompt: str) -> str:
@@ -604,40 +506,31 @@ RULE 4 — PROCEED AFTER CLOSE:
 
 
 # ---------------------------------------------------------------------------
-# on_step_end callback  ← stealth re-inject + captcha check added here only
+# Step callback — stealth + captcha + screenshot
 # ---------------------------------------------------------------------------
 
 def make_screenshot_callback(folder: str, counter: list[int]):
     async def _callback(agent) -> None:
         counter[0] += 1
         n = counter[0]
-
         try:
             browser_session = getattr(agent, "browser_session", None)
             if browser_session is None:
-                print(f"[Callback] step {n}: no browser_session on agent")
                 return
-
             page = await browser_session.get_current_page()
             if page is None:
-                print(f"[Callback] step {n}: get_current_page() returned None")
                 return
 
-            # ── Stealth: full stack (playwright-stealth + JS) ─────────────
             await apply_stealth_to_page(page)
-            # ── CAPTCHA check ─────────────────────────────────────────────
             await detect_and_solve_captcha(page)
-            # ── Human-like delay between steps ────────────────────────────
             await human_delay(300, 1200)
-            # ─────────────────────────────────────────────────────────────
 
-            img_b64 = await page.screenshot()  # returns base64 string
+            img_b64   = await page.screenshot()
             img_bytes = base64.b64decode(img_b64)
-            path = os.path.join(folder, f"step_{n:04d}_cb.png")
+            path      = os.path.join(folder, f"step_{n:04d}_cb.png")
             with open(path, "wb") as fh:
                 fh.write(img_bytes)
             print(f"[Callback] step {n:03d} → {path}")
-
         except Exception as exc:
             print(f"[Callback] step {n} screenshot failed: {exc}")
 
@@ -645,7 +538,7 @@ def make_screenshot_callback(folder: str, counter: list[int]):
 
 
 # ---------------------------------------------------------------------------
-# Build LLM
+# LLM builder
 # ---------------------------------------------------------------------------
 
 def build_llm(model: str, api_key: str):
@@ -668,60 +561,49 @@ def build_llm(model: str, api_key: str):
 
 
 # ---------------------------------------------------------------------------
-# Result cleaner — strips markdown fences, returns pure JSON if possible
+# Result cleaner
 # ---------------------------------------------------------------------------
 
 def _clean_result(text: str) -> str:
-    """
-    Clean the agent final result:
-    1. Strip browser-use XML wrapper tags (<url>, <query>, <result>)
-    2. Strip markdown code fences
-    3. Pretty-print if valid JSON
-    4. Return plain text otherwise
-    """
     if not text:
         return text
-
     text = text.strip()
     import re as _r
-
-    # Step 1: If there is a <result>...</result> block, extract only that
     result_block = _r.search(r'<result>\s*(.*?)\s*</result>', text, _r.DOTALL)
     if result_block:
         text = result_block.group(1).strip()
-
-    # Step 2: Strip markdown code fences  or 
     fenced = _r.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', text, _r.DOTALL)
     if fenced:
         text = fenced.group(1).strip()
-
-    # Step 3: Try to parse as JSON — return the object directly (FastAPI will serialize it)
     try:
-        parsed = json.loads(text)
-        return parsed
+        return json.loads(text)
     except Exception:
         pass
-
-    # Step 4: Return cleaned plain text
     return text
 
 
 # ---------------------------------------------------------------------------
-# Endpoint
+# Main endpoint
 # ---------------------------------------------------------------------------
 
 @app.post("/agent/run", response_model=AgentResponse)
 async def run_agent(request: AgentRequest) -> AgentResponse:
+    global _ACTIVE_PROXY
+
     session_id  = str(uuid.uuid4())[:8]
     timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
     folder_name = f"{SCAN_DIR}/{timestamp}_{session_id}"
     os.makedirs(folder_name, exist_ok=True)
+
+    # Pick ONE proxy for this entire session — browser + CapSolver both use it
+    _ACTIVE_PROXY = _pick_proxy()
 
     print(f"\n{'='*60}")
     print(f"[Agent] Session   : {session_id}")
     print(f"[Agent] Task      : {request.prompt}")
     print(f"[Agent] Model     : {request.model}")
     print(f"[Agent] Max steps : {request.max_steps}")
+    print(f"[Proxy] Session proxy: {_ACTIVE_PROXY['host']}:{_ACTIVE_PROXY['port']}")
     print(f"{'='*60}\n")
 
     llm          = build_llm(request.model, os.getenv("OPENAI_API_KEY", ""))
@@ -739,16 +621,10 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
     )
 
     browser = None
-    # Set active proxy for this session (used by both browser + CapSolver)
-    global _ACTIVE_PROXY
-    _ACTIVE_PROXY = random.choice(PROXY_POOL)
-    print(f"[Proxy] Session proxy: {_ACTIVE_PROXY['host']}:{_ACTIVE_PROXY['port']}")
-
     if BrowserConfig is not None and Browser is not None:
         try:
-            proxy = _pick_proxy()
-            proxy_url = f"http://{proxy['user']}:{proxy['pass']}@{proxy['host']}:{proxy['port']}"
-            print(f"[Proxy] Using {proxy['host']}:{proxy['port']}")
+            proxy_url = _proxy_server_url(_ACTIVE_PROXY)
+            print(f"[Proxy] Browser proxy URL: {_ACTIVE_PROXY['host']}:{_ACTIVE_PROXY['port']}")
 
             browser_cfg = BrowserConfig(
                 headless=True,
@@ -759,14 +635,10 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
                     "--window-size=1920,1080",
-                    # ── Stealth flags ─────────────────────────────────────
                     "--disable-features=IsolateOrigins,site-per-process",
                     "--disable-background-timer-throttling",
                     "--disable-backgrounding-occluded-windows",
                     "--disable-renderer-backgrounding",
-                    # ── Persistent profile (reuse cookies across sessions) ─
-                    f"--user-data-dir={PROFILE_DIR}",
-                    # ── Look like a real Chrome install ───────────────────
                     "--no-first-run",
                     "--no-default-browser-check",
                     "--password-store=basic",
@@ -789,28 +661,21 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
 
     try:
         history     = await agent.run(max_steps=request.max_steps, on_step_end=on_step_end)
-        # Extract only the final clean result from the done action
         result_text = ""
         try:
             all_results = history.all_results or []
-
-            # Priority 1: action with is_done=True
             for action in reversed(all_results):
                 if getattr(action, 'is_done', False):
                     raw = getattr(action, 'extracted_content', '') or ''
                     if raw:
                         result_text = raw
                         break
-
-            # Priority 2: last_action text from model outputs (the done text field)
             if not result_text:
                 for out in reversed(history.all_model_outputs or []):
                     done_block = out.get('done', {}) if isinstance(out, dict) else {}
                     if done_block.get('text'):
                         result_text = done_block['text']
                         break
-
-            # Priority 3: last extracted_content that looks like real content
             if not result_text:
                 skip = ('🔗', '🔍', 'Clicked', 'Typed', 'Waited', 'Scrolled', 'Searched')
                 for action in reversed(all_results):
@@ -820,19 +685,18 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
                         break
         except Exception:
             result_text = ""
-        # ── Clean up: extract JSON block if present, else return plain text ──
+
         if result_text:
             import re as _re2
             json_match = _re2.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', result_text, _re2.DOTALL)
             if json_match:
                 try:
-                    import json as _json
-                    parsed = _json.loads(json_match.group(1))
-                    result_text = _json.dumps(parsed, ensure_ascii=False, indent=2)
-                    print("[Agent] Extracted clean JSON from result ✅")
+                    parsed      = json.loads(json_match.group(1))
+                    result_text = json.dumps(parsed, ensure_ascii=False, indent=2)
                 except Exception:
-                    pass  # keep raw text if JSON parse fails
-        print(f"[Agent] ✅ Completed in {step_counter[0]} callback steps")
+                    pass
+
+        print(f"[Agent] ✅ Completed in {step_counter[0]} steps")
 
     except Exception as exc:
         import traceback
@@ -848,20 +712,14 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
             except Exception:
                 pass
 
-    # ── 1. Try extracting from the history object ─────────────────────────
     if history is not None:
-        saved = _dump_history_screenshots(history, folder_name)
-        print(f"[Agent] Extracted {saved} screenshot(s) from history object")
-
-    # ── 2. Extract from conversation_*.json files (primary source in 0.11.x)
-    json_saved = _dump_json_screenshots(folder_name)
-    print(f"[Agent] Extracted {json_saved} screenshot(s) from JSON files")
+        _dump_history_screenshots(history, folder_name)
+    _dump_json_screenshots(folder_name)
 
     steps_taken = step_counter[0] or (
         len(getattr(history, "all_results", []) or []) if history else 0
     )
 
-    # ── 3. Guarantee ≥1 frame ─────────────────────────────────────────────
     _ensure_minimum_frames(folder_name)
 
     frame_count = len(glob.glob(os.path.join(folder_name, "*.png")))
@@ -869,7 +727,6 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
     video_url = await create_and_upload_video(folder_name, session_id)
     print(f"[Agent] Video URL : {video_url}")
 
-    # ── 4. Clean up local scan folder to save disk space ──────────────────
     try:
         shutil.rmtree(folder_name)
         print(f"[Cleanup] Deleted scan folder: {folder_name}")
