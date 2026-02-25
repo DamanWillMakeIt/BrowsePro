@@ -50,7 +50,7 @@ os.makedirs(SCAN_DIR, exist_ok=True)
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
 
 # ---------------------------------------------------------------------------
-# RESIDENTIAL PROXY POOL — single source of truth, no duplicates
+# RESIDENTIAL PROXY POOL — single source of truth
 # ---------------------------------------------------------------------------
 PROXY_POOL = [
     {"host": os.getenv("PROXY_1_HOST", "104.252.62.99"),  "port": os.getenv("PROXY_1_PORT", "5470"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
@@ -63,13 +63,16 @@ PROXY_POOL = [
 # Single active proxy per session — set once in run_agent, shared by browser + CapSolver
 _ACTIVE_PROXY: dict = PROXY_POOL[0]
 
+
 def _pick_proxy() -> dict:
     """Pick a random proxy from the pool."""
     return random.choice(PROXY_POOL)
 
+
 def _proxy_server_url(proxy: dict) -> str:
     """Returns http://user:pass@host:port for Playwright BrowserConfig."""
     return f"http://{proxy['user']}:{proxy['pass']}@{proxy['host']}:{proxy['port']}"
+
 
 # Persistent browser profile directory
 PROFILE_DIR = os.path.join(os.getcwd(), "browser_profile")
@@ -119,6 +122,46 @@ WebGLRenderingContext.prototype.getParameter = function(p) {
     return _origGP.call(this,p);
 };
 """
+
+
+# ---------------------------------------------------------------------------
+# SAFE PAGE HELPERS — handle both property and coroutine Playwright versions
+# ---------------------------------------------------------------------------
+
+async def _page_url(page) -> str:
+    """Safely get page URL regardless of Playwright version."""
+    try:
+        url = page.url
+        if asyncio.iscoroutine(url):
+            url = await url
+        return url or ""
+    except Exception:
+        try:
+            return await page.evaluate("() => window.location.href")
+        except Exception:
+            return ""
+
+
+async def _page_frames(page) -> list:
+    """Safely get page frames regardless of Playwright version."""
+    try:
+        frames = page.frames
+        if asyncio.iscoroutine(frames):
+            frames = await frames
+        return frames or []
+    except Exception:
+        return []
+
+
+async def _frame_url(frame) -> str:
+    """Safely get frame URL regardless of Playwright version."""
+    try:
+        url = frame.url
+        if asyncio.iscoroutine(url):
+            url = await url
+        return url or ""
+    except Exception:
+        return ""
 
 
 # ---------------------------------------------------------------------------
@@ -175,25 +218,15 @@ async def detect_and_solve_captcha(page) -> None:
             except Exception:
                 return
 
-        # FIX: page.url is a property in some Playwright versions, coroutine in others
-        try:
-            page_url = page.url
-            if asyncio.iscoroutine(page_url):
-                page_url = await page_url
-        except Exception:
-            page_url = await page.evaluate("() => window.location.href")
-
-        proxy = _ACTIVE_PROXY
+        # Safe URL and frames access — fixes 'Page has no attribute url/frames'
+        page_url = await _page_url(page)
+        frames   = await _page_frames(page)
+        proxy    = _ACTIVE_PROXY
 
         # ── Cloudflare Turnstile ──────────────────────────────────────────
         ts_key = None
-        for frame in page.frames:
-            try:
-                frame_url = frame.url
-                if asyncio.iscoroutine(frame_url):
-                    frame_url = await frame_url
-            except Exception:
-                frame_url = ""
+        for frame in frames:
+            frame_url = await _frame_url(frame)
             if "challenges.cloudflare.com" in frame_url or "turnstile" in frame_url.lower():
                 m = _re.search(r'[?&]k=([^&]+)', frame_url)
                 if m:
@@ -235,13 +268,8 @@ async def detect_and_solve_captcha(page) -> None:
 
         # ── reCAPTCHA v2 ─────────────────────────────────────────────────
         rc_key = None
-        for frame in page.frames:
-            try:
-                frame_url = frame.url
-                if asyncio.iscoroutine(frame_url):
-                    frame_url = await frame_url
-            except Exception:
-                frame_url = ""
+        for frame in frames:
+            frame_url = await _frame_url(frame)
             if "recaptcha" in frame_url and "anchor" in frame_url:
                 m = _re.search(r'[?&]k=([^&]+)', frame_url)
                 if m:
@@ -251,7 +279,9 @@ async def detect_and_solve_captcha(page) -> None:
                     if await cb.count() > 0:
                         await cb.click(timeout=3000)
                         await asyncio.sleep(3)
-                        if not any("bframe" in f.url for f in page.frames):
+                        # Re-fetch frames after click
+                        new_frames = await _page_frames(page)
+                        if not any("bframe" in (await _frame_url(f)) for f in new_frames):
                             print("[CAPTCHA] reCAPTCHA checkbox passed ✅")
                             return
                 except Exception:
@@ -569,7 +599,7 @@ def _clean_result(text: str) -> str:
         return text
     text = text.strip()
     import re as _r
-    result_block = _r.search(r'<result>\s*(.*?)\s*</result>', text, _r.DOTALL)
+    result_block = _r.search(r'<r>\s*(.*?)\s*</r>', text, _r.DOTALL)
     if result_block:
         text = result_block.group(1).strip()
     fenced = _r.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', text, _r.DOTALL)
