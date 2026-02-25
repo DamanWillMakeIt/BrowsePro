@@ -88,6 +88,16 @@ except ImportError:
     print("[Stealth] playwright-stealth not installed — using JS-only stealth")
     print("[Stealth] Run: pip install playwright-stealth")
 
+# ---------------------------------------------------------------------------
+# DEPLOY VERIFICATION — confirms new image is live on every startup
+# ---------------------------------------------------------------------------
+import sys
+print("=" * 60)
+print(f"[Deploy] Python: {sys.version}")
+print(f"[Deploy] playwright-stealth: {'INSTALLED ✅' if STEALTH_LIB_AVAILABLE else 'MISSING ❌'}")
+print(f"[Deploy] CAPSOLVER_API_KEY : {'SET ✅' if CAPSOLVER_API_KEY else 'NOT SET ❌'}")
+print("=" * 60)
+
 
 # ---------------------------------------------------------------------------
 # STEALTH SCRIPT
@@ -673,6 +683,10 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
                     "--no-default-browser-check",
                     "--password-store=basic",
                     "--use-mock-keychain",
+                    "--single-process",
+                    "--disable-extensions",
+                    "--disable-default-apps",
+                    "--no-zygote",
                     '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                     'AppleWebKit/537.36 (KHTML, like Gecko) '
                     'Chrome/131.0.0.0 Safari/537.36',
