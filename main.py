@@ -8,15 +8,21 @@ Run:
 """
 
 from __future__ import annotations
+from typing import Any
 
+import asyncio
 import base64
 import glob
 import json
 import os
+import random
+import re as _re
 import shutil
 import uuid
 from datetime import datetime
+from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -41,6 +47,228 @@ app = FastAPI(title="OnDemand Browser-Use Agent", version="1.0.0")
 SCAN_DIR = "scans"
 os.makedirs(SCAN_DIR, exist_ok=True)
 
+CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
+
+# Persistent browser profile — reuses cookies/localStorage across sessions
+PROFILE_DIR = os.path.join(os.getcwd(), "browser_profile")
+os.makedirs(PROFILE_DIR, exist_ok=True)
+
+# playwright-stealth — fixes TLS fingerprint + deeper signals
+try:
+    from playwright_stealth import stealth_async as _stealth_async
+    STEALTH_LIB_AVAILABLE = True
+    print("[Stealth] playwright-stealth available ✅")
+except ImportError:
+    STEALTH_LIB_AVAILABLE = False
+    print("[Stealth] playwright-stealth not installed — using JS-only stealth")
+    print("[Stealth] Run: pip install playwright-stealth")
+
+
+# ---------------------------------------------------------------------------
+# STEALTH + CAPTCHA  (new additions — everything below this block is original)
+# ---------------------------------------------------------------------------
+
+STEALTH_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+Object.defineProperty(navigator, 'plugins', { get: () => [
+    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+    { name: 'Native Client',     filename: 'internal-nacl-plugin',                description: '' },
+]});
+Object.defineProperty(navigator, 'languages',           { get: () => ['en-US', 'en'] });
+Object.defineProperty(navigator, 'platform',            { get: () => 'Win32' });
+Object.defineProperty(navigator, 'vendor',              { get: () => 'Google Inc.' });
+Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+Object.defineProperty(navigator, 'deviceMemory',        { get: () => 8 });
+window.chrome = { runtime: {}, loadTimes: () => ({}), csi: () => ({}), app: {} };
+const _origQuery = window.navigator.permissions.query.bind(navigator.permissions);
+window.navigator.permissions.query = (p) =>
+    p.name === 'notifications'
+        ? Promise.resolve({ state: Notification.permission })
+        : _origQuery(p);
+const _origToDataURL = HTMLCanvasElement.prototype.toDataURL;
+HTMLCanvasElement.prototype.toDataURL = function(type, ...a) {
+    const ctx = this.getContext('2d');
+    if (ctx) { const d = ctx.getImageData(0,0,this.width||1,this.height||1); d.data[0]^=1; ctx.putImageData(d,0,0); }
+    return _origToDataURL.call(this, type, ...a);
+};
+const _origGP = WebGLRenderingContext.prototype.getParameter;
+WebGLRenderingContext.prototype.getParameter = function(p) {
+    if (p===37445) return 'Intel Inc.'; if (p===37446) return 'Intel Iris OpenGL Engine';
+    return _origGP.call(this,p);
+};
+"""
+
+
+async def _capsolver_solve(task: dict) -> dict | None:
+    if not CAPSOLVER_API_KEY:
+        return None
+    try:
+        async with httpx.AsyncClient(timeout=30) as c:
+            r = await c.post("https://api.capsolver.com/createTask",
+                             json={"clientKey": CAPSOLVER_API_KEY, "task": task})
+            data = r.json()
+            if data.get("errorId") != 0:
+                print(f"[CapSolver] Error: {data.get('errorDescription')}")
+                return None
+            task_id = data["taskId"]
+        async with httpx.AsyncClient(timeout=30) as c:
+            for _ in range(60):
+                await asyncio.sleep(2)
+                r = await c.post("https://api.capsolver.com/getTaskResult",
+                                 json={"clientKey": CAPSOLVER_API_KEY, "taskId": task_id})
+                d = r.json()
+                if d.get("status") == "ready":
+                    return d.get("solution", {})
+                if d.get("status") == "failed":
+                    return None
+    except Exception as exc:
+        print(f"[CapSolver] Exception: {exc}")
+    return None
+
+
+async def detect_and_solve_captcha(page) -> None:
+    """Detect and solve Turnstile / reCAPTCHA v2 / hCaptcha on the current page."""
+    try:
+        try:
+            html = await page.content()
+        except Exception:
+            try:
+                html = await page.evaluate("() => document.documentElement.outerHTML")
+            except Exception:
+                return
+        page_url = page.url
+
+        # ── Cloudflare Turnstile ──────────────────────────────────────────
+        ts_key = None
+        for frame in page.frames:
+            if "challenges.cloudflare.com" in frame.url or "turnstile" in frame.url.lower():
+                m = _re.search(r'[?&]k=([^&]+)', frame.url)
+                if m: ts_key = m.group(1)
+                break
+        if not ts_key:
+            m = _re.search(r'data-sitekey=["\']([^"\']+)["\']', html)
+            if m and ("cf-turnstile" in html or "turnstile" in html.lower()):
+                ts_key = m.group(1)
+        if ts_key:
+            print(f"[CAPTCHA] Turnstile detected — solving…")
+            sol = await _capsolver_solve({"type": "AntiTurnstileTaskProxyLess",
+                                          "websiteURL": page_url, "websiteKey": ts_key})
+            if sol:
+                token = sol.get("token", "")
+                await page.evaluate("""(t) => {
+                    document.querySelectorAll('input[name*="cf-turnstile-response"],input[name*="turnstile"]')
+                        .forEach(el => { el.value=t; el.dispatchEvent(new Event('change',{bubbles:true})); });
+                    const el = document.querySelector('.cf-turnstile,[data-sitekey]');
+                    if (el) { const cb=el.getAttribute('data-callback'); if(cb&&window[cb]) try{window[cb](t);}catch(e){} }
+                }""", token)
+                print("[CAPTCHA] Turnstile injected ✅")
+            return
+
+        # ── Cloudflare JS challenge (no sitekey — wait it out) ────────────
+        if "Just a moment" in html or "cf-browser-verification" in html:
+            print("[CAPTCHA] Cloudflare JS challenge — waiting up to 15s…")
+            for _ in range(15):
+                await asyncio.sleep(1)
+                new_html = await page.content()
+                if "Just a moment" not in new_html:
+                    print("[CAPTCHA] Cloudflare cleared ✅")
+                    return
+            print("[CAPTCHA] Cloudflare challenge persists")
+            return
+
+        # ── reCAPTCHA v2 ─────────────────────────────────────────────────
+        rc_key = None
+        for frame in page.frames:
+            if "recaptcha" in frame.url and "anchor" in frame.url:
+                m = _re.search(r'[?&]k=([^&]+)', frame.url)
+                if m: rc_key = m.group(1)
+                # Try free checkbox click first
+                try:
+                    cb = frame.locator(".recaptcha-checkbox-border").first
+                    if await cb.count() > 0:
+                        await cb.click(timeout=3000)
+                        await asyncio.sleep(3)
+                        if not any("bframe" in f.url for f in page.frames):
+                            print("[CAPTCHA] reCAPTCHA checkbox passed ✅")
+                            return
+                except Exception:
+                    pass
+                break
+        if not rc_key:
+            m = _re.search(r'data-sitekey=["\']([^"\']+)["\']', html)
+            if m: rc_key = m.group(1)
+        if rc_key and "6L" in rc_key:
+            print("[CAPTCHA] reCAPTCHA v2 detected — solving…")
+            sol = await _capsolver_solve({"type": "ReCaptchaV2TaskProxyLess",
+                                          "websiteURL": page_url, "websiteKey": rc_key})
+            if sol:
+                token = sol.get("gRecaptchaResponse", "")
+                await page.evaluate("""(t) => {
+                    document.querySelectorAll('[name="g-recaptcha-response"]')
+                        .forEach(el => { el.innerHTML=t; el.value=t; el.style.display='block'; });
+                    document.querySelectorAll('[data-callback]').forEach(el => {
+                        const cb=el.getAttribute('data-callback');
+                        if(cb&&window[cb]) try{window[cb](t);}catch(e){}
+                    });
+                    const ta=document.querySelector('textarea[name="g-recaptcha-response"]');
+                    if(ta){const f=ta.closest('form');if(f)try{f.submit();}catch(e){}}
+                }""", token)
+                print("[CAPTCHA] reCAPTCHA v2 injected ✅")
+            return
+
+        # ── hCaptcha ──────────────────────────────────────────────────────
+        if "hcaptcha" in html.lower():
+            m = _re.search(r'data-sitekey=["\']([^"\']+)["\']', html)
+            if m:
+                print("[CAPTCHA] hCaptcha detected — solving…")
+                sol = await _capsolver_solve({"type": "HCaptchaTaskProxyLess",
+                                              "websiteURL": page_url, "websiteKey": m.group(1)})
+                if sol:
+                    token = sol.get("gRecaptchaResponse", "")
+                    await page.evaluate("""(t) => {
+                        const ta=document.querySelector('[name="h-captcha-response"]');
+                        if(ta){ta.innerHTML=t;ta.value=t;}
+                        document.querySelectorAll('[data-callback]').forEach(el=>{
+                            const cb=el.getAttribute('data-callback');
+                            if(cb&&window[cb])try{window[cb](t);}catch(e){}
+                        });
+                    }""", token)
+                    print("[CAPTCHA] hCaptcha injected ✅")
+
+    except Exception as exc:
+        print(f"[CAPTCHA] detect_and_solve error: {exc}")
+
+
+# ---------------------------------------------------------------------------
+# HUMAN-LIKE BEHAVIOUR HELPERS
+# ---------------------------------------------------------------------------
+
+async def human_delay(min_ms: int = 500, max_ms: int = 2000) -> None:
+    """Random delay to mimic human reaction time between actions."""
+    await asyncio.sleep(random.uniform(min_ms / 1000, max_ms / 1000))
+
+
+async def apply_stealth_to_page(page) -> None:
+    """
+    Apply all stealth layers to a Playwright page:
+    1. playwright-stealth library (fixes TLS + deep signals)
+    2. Our custom JS stealth script (navigator, canvas, WebGL)
+    """
+    # Layer 1: playwright-stealth (fixes TLS fingerprint)
+    if STEALTH_LIB_AVAILABLE:
+        try:
+            await _stealth_async(page)
+            print("[Stealth] playwright-stealth applied ✅")
+        except Exception as exc:
+            print(f"[Stealth] playwright-stealth failed: {exc}")
+
+    # Layer 2: custom JS stealth
+    try:
+        await page.add_init_script(STEALTH_SCRIPT)
+    except Exception:
+        pass
+
 
 # ---------------------------------------------------------------------------
 # Models
@@ -53,10 +281,9 @@ class AgentRequest(BaseModel):
 
 
 class AgentResponse(BaseModel):
-    status: str
-    result: str
     video_url: str | None = None
     steps_taken: int = 0
+    extracted_data: Any = None
 
 
 # ---------------------------------------------------------------------------
@@ -76,17 +303,15 @@ def _ensure_minimum_frames(folder: str) -> None:
         img  = Image.new("RGB", (1920, 1080), color=(30, 30, 30))
         draw = ImageDraw.Draw(img)
         msg  = "No screenshot captured"
-        # ImageDraw.textlength available in Pillow ≥ 8; bbox fallback for older
         try:
             tw = draw.textlength(msg)
         except AttributeError:
-            tw = len(msg) * 8  # rough fallback
+            tw = len(msg) * 8
         draw.text(((1920 - tw) / 2, 520), msg, fill=(180, 180, 180))
         img.save(path, "PNG")
         print(f"[Frames] Placeholder written → {path}")
     except Exception as exc:
         print(f"[Frames] Pillow placeholder failed ({exc}), writing raw PNG.")
-        # Minimal valid 1×1 white PNG (should never reach here given Pillow is installed)
         import struct, zlib
         def _chunk(tag: bytes, data: bytes) -> bytes:
             crc = zlib.crc32(tag + data) & 0xFFFFFFFF
@@ -120,7 +345,6 @@ def _dump_history_screenshots(history, folder: str) -> int:
             raw = raw.split(",", 1)[1]
         try:
             img_bytes = base64.b64decode(raw)
-            # Quick sanity check — must start with PNG or JPEG magic bytes
             if not (img_bytes[:4] == b'\x89PNG' or img_bytes[:2] == b'\xff\xd8'):
                 return False
             path = os.path.join(folder, f"{label}.png")
@@ -134,23 +358,19 @@ def _dump_history_screenshots(history, folder: str) -> int:
             return False
 
     try:
-        # all_results: list of ActionResult
         results = getattr(history, "all_results", []) or []
         for i, result in enumerate(results):
             for attr in ("screenshot", "base64_screenshot", "image", "screenshot_b64"):
                 if _save(getattr(result, attr, None), f"step_{i+1:04d}_result"):
                     break
 
-        # history.history: list of AgentHistory (each step)
         histories = getattr(history, "history", []) or []
         for i, h in enumerate(histories):
-            # browser-use 0.11 stores the screenshot on the state object
             state = getattr(h, "state", None)
             if state is not None:
                 for attr in ("screenshot", "base64_screenshot", "image", "screenshot_b64"):
                     if _save(getattr(state, attr, None), f"step_{i+1:04d}_state"):
                         break
-            # also try directly on the history object
             for attr in ("screenshot", "base64_screenshot", "image", "screenshot_b64"):
                 if _save(getattr(h, attr, None), f"step_{i+1:04d}_h"):
                     break
@@ -189,8 +409,6 @@ def _dump_json_screenshots(folder: str) -> int:
             print(f"[JSON] Could not parse {json_path}: {exc}")
             continue
 
-        # The JSON is a list of message dicts; each message may have
-        # a "content" list containing image blocks.
         messages = data if isinstance(data, list) else data.get("messages", [])
 
         for msg in messages:
@@ -200,9 +418,7 @@ def _dump_json_screenshots(folder: str) -> int:
             for block in content:
                 if not isinstance(block, dict):
                     continue
-                # OpenAI vision format: {"type": "image_url", "image_url": {"url": "data:..."}}
                 img_url = (block.get("image_url") or {}).get("url", "")
-                # Anthropic format: {"type": "image", "source": {"data": "...", "type": "base64"}}
                 source  = block.get("source") or {}
                 raw     = ""
 
@@ -218,7 +434,6 @@ def _dump_json_screenshots(folder: str) -> int:
                     img_bytes = base64.b64decode(raw)
                     if not (img_bytes[:4] == b'\x89PNG' or img_bytes[:2] == b'\xff\xd8'):
                         continue
-                    # Name by JSON file stem + index to keep ordering
                     stem  = os.path.splitext(os.path.basename(json_path))[0]
                     fname = f"{stem}_img{saved+1:03d}.png"
                     out   = os.path.join(folder, fname)
@@ -267,16 +482,11 @@ RULE 4 — PROCEED AFTER CLOSE:
 
 
 # ---------------------------------------------------------------------------
-# on_step_end callback
+# on_step_end callback  ← stealth re-inject + captcha check added here only
 # ---------------------------------------------------------------------------
 
 def make_screenshot_callback(folder: str, counter: list[int]):
     async def _callback(agent) -> None:
-        """
-        browser-use 0.11.x calls: await on_step_end(self)
-        where self is the Agent instance.
-        agent.browser_session.get_current_page() returns the live Playwright page.
-        """
         counter[0] += 1
         n = counter[0]
 
@@ -290,6 +500,14 @@ def make_screenshot_callback(folder: str, counter: list[int]):
             if page is None:
                 print(f"[Callback] step {n}: get_current_page() returned None")
                 return
+
+            # ── Stealth: full stack (playwright-stealth + JS) ─────────────
+            await apply_stealth_to_page(page)
+            # ── CAPTCHA check ─────────────────────────────────────────────
+            await detect_and_solve_captcha(page)
+            # ── Human-like delay between steps ────────────────────────────
+            await human_delay(300, 1200)
+            # ─────────────────────────────────────────────────────────────
 
             img_b64 = await page.screenshot()  # returns base64 string
             img_bytes = base64.b64decode(img_b64)
@@ -325,6 +543,45 @@ def build_llm(model: str, api_key: str):
     except Exception:
         pass
     raise RuntimeError("Could not build LLM")
+
+
+# ---------------------------------------------------------------------------
+# Result cleaner — strips markdown fences, returns pure JSON if possible
+# ---------------------------------------------------------------------------
+
+def _clean_result(text: str) -> str:
+    """
+    Clean the agent final result:
+    1. Strip browser-use XML wrapper tags (<url>, <query>, <result>)
+    2. Strip markdown code fences
+    3. Pretty-print if valid JSON
+    4. Return plain text otherwise
+    """
+    if not text:
+        return text
+
+    text = text.strip()
+    import re as _r
+
+    # Step 1: If there is a <result>...</result> block, extract only that
+    result_block = _r.search(r'<result>\s*(.*?)\s*</result>', text, _r.DOTALL)
+    if result_block:
+        text = result_block.group(1).strip()
+
+    # Step 2: Strip markdown code fences  or 
+    fenced = _r.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', text, _r.DOTALL)
+    if fenced:
+        text = fenced.group(1).strip()
+
+    # Step 3: Try to parse as JSON — return the object directly (FastAPI will serialize it)
+    try:
+        parsed = json.loads(text)
+        return parsed
+    except Exception:
+        pass
+
+    # Step 4: Return cleaned plain text
+    return text
 
 
 # ---------------------------------------------------------------------------
@@ -370,6 +627,21 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
                     "--disable-dev-shm-usage",
                     "--disable-gpu",
                     "--window-size=1920,1080",
+                    # ── Stealth flags ─────────────────────────────────────
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-background-timer-throttling",
+                    "--disable-backgrounding-occluded-windows",
+                    "--disable-renderer-backgrounding",
+                    # ── Persistent profile (reuse cookies across sessions) ─
+                    f"--user-data-dir={PROFILE_DIR}",
+                    # ── Look like a real Chrome install ───────────────────
+                    "--no-first-run",
+                    "--no-default-browser-check",
+                    "--password-store=basic",
+                    "--use-mock-keychain",
+                    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                    'AppleWebKit/537.36 (KHTML, like Gecko) '
+                    'Chrome/131.0.0.0 Safari/537.36',
                 ],
             )
             browser = Browser(config=browser_cfg)
@@ -385,7 +657,49 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
 
     try:
         history     = await agent.run(max_steps=request.max_steps, on_step_end=on_step_end)
-        result_text = str(history)
+        # Extract only the final clean result from the done action
+        result_text = ""
+        try:
+            all_results = history.all_results or []
+
+            # Priority 1: action with is_done=True
+            for action in reversed(all_results):
+                if getattr(action, 'is_done', False):
+                    raw = getattr(action, 'extracted_content', '') or ''
+                    if raw:
+                        result_text = raw
+                        break
+
+            # Priority 2: last_action text from model outputs (the done text field)
+            if not result_text:
+                for out in reversed(history.all_model_outputs or []):
+                    done_block = out.get('done', {}) if isinstance(out, dict) else {}
+                    if done_block.get('text'):
+                        result_text = done_block['text']
+                        break
+
+            # Priority 3: last extracted_content that looks like real content
+            if not result_text:
+                skip = ('🔗', '🔍', 'Clicked', 'Typed', 'Waited', 'Scrolled', 'Searched')
+                for action in reversed(all_results):
+                    text = getattr(action, 'extracted_content', '') or ''
+                    if text and not any(text.startswith(s) for s in skip):
+                        result_text = text
+                        break
+        except Exception:
+            result_text = ""
+        # ── Clean up: extract JSON block if present, else return plain text ──
+        if result_text:
+            import re as _re2
+            json_match = _re2.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', result_text, _re2.DOTALL)
+            if json_match:
+                try:
+                    import json as _json
+                    parsed = _json.loads(json_match.group(1))
+                    result_text = _json.dumps(parsed, ensure_ascii=False, indent=2)
+                    print("[Agent] Extracted clean JSON from result ✅")
+                except Exception:
+                    pass  # keep raw text if JSON parse fails
         print(f"[Agent] ✅ Completed in {step_counter[0]} callback steps")
 
     except Exception as exc:
@@ -424,7 +738,6 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
     print(f"[Agent] Video URL : {video_url}")
 
     # ── 4. Clean up local scan folder to save disk space ──────────────────
-    # Everything is already uploaded to Cloudinary — no need to keep it.
     try:
         shutil.rmtree(folder_name)
         print(f"[Cleanup] Deleted scan folder: {folder_name}")
@@ -432,10 +745,9 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
         print(f"[Cleanup] Could not delete scan folder: {exc}")
 
     return AgentResponse(
-        status=final_status,
-        result=result_text,
         video_url=video_url,
         steps_taken=steps_taken,
+        extracted_data=_clean_result(result_text) or None,
     )
 
 
