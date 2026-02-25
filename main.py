@@ -5,6 +5,17 @@ FastAPI wrapper around browser-use 0.11.x.
 
 Run:
     uvicorn main:app --reload --host 0.0.0.0 --port 8000
+
+Fixes in this version:
+  1. Unwrap real Playwright page from browser-use wrapper before calling stealth/add_init_script
+     Root cause: browser-use passes a wrapper object, not a raw Playwright Page.
+     playwright-stealth and add_init_script need the real page — we extract it via
+     page.page, page._page, or context.pages[-1] fallbacks.
+  2. Proxy verification moved into step 1 of callback (browser_session ready by then)
+  3. proxy dict format (server/username/password) — not URL string
+  4. Removed --single-process / --disable-extensions / --no-zygote (break proxy auth)
+  5. page.screenshot() returns bytes — no base64.b64decode needed
+  6. _capsolver_solve shallow-copies task dict before mutation
 """
 
 from __future__ import annotations
@@ -51,7 +62,7 @@ os.makedirs(SCAN_DIR, exist_ok=True)
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
 
 # ---------------------------------------------------------------------------
-# RESIDENTIAL PROXY POOL — single source of truth
+# PROXY POOL — single source of truth
 # ---------------------------------------------------------------------------
 PROXY_POOL = [
     {"host": os.getenv("PROXY_1_HOST", "104.252.62.99"),  "port": os.getenv("PROXY_1_PORT", "5470"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
@@ -61,24 +72,17 @@ PROXY_POOL = [
     {"host": os.getenv("PROXY_5_HOST", "192.46.188.160"), "port": os.getenv("PROXY_5_PORT", "5819"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
 ]
 
-# Single active proxy per session — set once in run_agent(), shared by browser + CapSolver
 _ACTIVE_PROXY: dict = PROXY_POOL[0]
 
 
 def _pick_proxy() -> dict:
-    """Pick a random proxy from the pool."""
     return random.choice(PROXY_POOL)
 
 
 def _proxy_browser_dict(proxy: dict) -> dict:
     """
-    Returns the proxy dict that Playwright / BrowserConfig actually accepts.
-
-    CRITICAL: BrowserConfig(proxy=...) requires a dict with keys:
-      server, username, password
-    Passing a plain URL string (http://user:pass@host:port) is silently ignored
-    in most browser-use / Playwright versions — the browser then launches with
-    NO proxy at all, exposing the server's real IP and triggering bot detection.
+    Dict format Playwright BrowserConfig actually accepts.
+    A plain URL string is silently ignored — browser launches with no proxy.
     """
     return {
         "server":   f"http://{proxy['host']}:{proxy['port']}",
@@ -87,13 +91,8 @@ def _proxy_browser_dict(proxy: dict) -> dict:
     }
 
 
-def _proxy_url_string(proxy: dict) -> str:
-    """Returns http://user:pass@host:port — for logging only."""
-    return f"http://{proxy['user']}:{proxy['pass']}@{proxy['host']}:{proxy['port']}"
-
-
 # ---------------------------------------------------------------------------
-# PERSISTENT BROWSER PROFILE
+# PERSISTENT PROFILE
 # ---------------------------------------------------------------------------
 PROFILE_DIR = os.path.join(os.getcwd(), "browser_profile")
 os.makedirs(PROFILE_DIR, exist_ok=True)
@@ -111,11 +110,10 @@ except ImportError:
     print("[Stealth] Run: pip install playwright-stealth")
 
 # ---------------------------------------------------------------------------
-# DEPLOY VERIFICATION — printed on every startup so you can confirm the
-# correct image/code is running
+# DEPLOY VERIFICATION
 # ---------------------------------------------------------------------------
 print("=" * 60)
-print(f"[Deploy] Python           : {sys.version}")
+print(f"[Deploy] Python            : {sys.version}")
 print(f"[Deploy] playwright-stealth: {'INSTALLED ✅' if STEALTH_LIB_AVAILABLE else 'MISSING ❌'}")
 print(f"[Deploy] CAPSOLVER_API_KEY : {'SET ✅' if CAPSOLVER_API_KEY else 'NOT SET ❌'}")
 print(f"[Deploy] Proxy pool size   : {len(PROXY_POOL)}")
@@ -157,14 +155,55 @@ WebGLRenderingContext.prototype.getParameter = function(p) {
 
 
 # ---------------------------------------------------------------------------
-# SAFE PAGE HELPERS
-# Fixes: 'Page' object has no attribute 'url' / 'frames'
-# browser-use wraps Playwright pages; .url and .frames may be coroutines
-# depending on the version. These helpers handle both cases safely.
+# REAL PAGE UNWRAPPER
+#
+# browser-use wraps Playwright pages in its own objects.
+# playwright-stealth and add_init_script need the REAL Playwright Page.
+# We try several known attribute paths to unwrap it.
+# ---------------------------------------------------------------------------
+
+async def _unwrap_page(page):
+    """
+    Extract the real Playwright Page from a browser-use wrapper.
+    Returns the raw page, or the original object if unwrapping fails.
+    Tries: page.page, page._page, page._playwright_page,
+           then context.pages[-1] as last resort.
+    """
+    # Try direct attribute unwrap
+    for attr in ("page", "_page", "_playwright_page", "playwright_page"):
+        inner = getattr(page, attr, None)
+        if inner is not None and hasattr(inner, "add_init_script"):
+            print(f"[Stealth] Unwrapped real page via .{attr} ✅")
+            return inner
+
+    # If the object itself already has add_init_script, it's already raw
+    if hasattr(page, "add_init_script"):
+        return page
+
+    # Last resort: grab from browser context
+    try:
+        context = getattr(page, "context", None) or getattr(page, "_context", None)
+        if context is not None:
+            pages = context.pages
+            if asyncio.iscoroutine(pages):
+                pages = await pages
+            if pages:
+                real = pages[-1]
+                if hasattr(real, "add_init_script"):
+                    print("[Stealth] Unwrapped real page via context.pages[-1] ✅")
+                    return real
+    except Exception:
+        pass
+
+    print("[Stealth] ⚠️ Could not unwrap page — stealth may not apply")
+    return page
+
+
+# ---------------------------------------------------------------------------
+# SAFE PAGE URL / FRAMES HELPERS
 # ---------------------------------------------------------------------------
 
 async def _page_url(page) -> str:
-    """Safely get page URL regardless of Playwright/browser-use version."""
     try:
         url = page.url
         if asyncio.iscoroutine(url):
@@ -178,7 +217,6 @@ async def _page_url(page) -> str:
 
 
 async def _page_frames(page) -> list:
-    """Safely get page frames list."""
     try:
         frames = page.frames
         if asyncio.iscoroutine(frames):
@@ -189,7 +227,6 @@ async def _page_frames(page) -> list:
 
 
 async def _frame_url(frame) -> str:
-    """Safely get a frame's URL."""
     try:
         url = frame.url
         if asyncio.iscoroutine(url):
@@ -201,43 +238,34 @@ async def _frame_url(frame) -> str:
 
 # ---------------------------------------------------------------------------
 # PROXY VERIFICATION
-# Navigates to ipinfo.io/json right after browser launch to confirm the
-# proxy is actually routing traffic. Logs the exit IP every session.
-# If the reported IP matches your server's real IP → proxy is NOT working.
 # ---------------------------------------------------------------------------
 
-async def _verify_proxy(browser_session, expected_proxy: dict) -> None:
+async def _verify_proxy(page, expected_proxy: dict) -> None:
+    """Navigate to ipinfo.io/json and log the exit IP to confirm proxy is active."""
     try:
-        page = await browser_session.get_current_page()
-        if page is None:
-            print("[ProxyCheck] Could not get page — skipping verification")
-            return
-
-        print("[ProxyCheck] Navigating to https://ipinfo.io/json to verify proxy…")
-        await page.goto("https://ipinfo.io/json", timeout=15000)
+        real_page = await _unwrap_page(page)
+        print("[ProxyCheck] Navigating to https://ipinfo.io/json …")
+        await real_page.goto("https://ipinfo.io/json", timeout=15000)
         await asyncio.sleep(2)
-
         try:
-            content = await page.evaluate("() => document.body.innerText")
+            content = await real_page.evaluate("() => document.body.innerText")
         except Exception:
-            content = await page.content()
+            content = await real_page.content()
 
-        print(f"[ProxyCheck] Expected proxy host : {expected_proxy['host']}")
-        print(f"[ProxyCheck] ipinfo.io response  : {content[:300]}")
-
+        print(f"[ProxyCheck] Expected proxy : {expected_proxy['host']}:{expected_proxy['port']}")
+        print(f"[ProxyCheck] Response       : {content[:300]}")
         try:
-            info        = json.loads(content)
+            info = json.loads(content)
             reported_ip = info.get("ip", "unknown")
             print(f"[ProxyCheck] Exit IP: {reported_ip}")
             if reported_ip == expected_proxy["host"]:
-                print("[ProxyCheck] 🟢 Exit IP matches proxy host — proxy ACTIVE")
+                print("[ProxyCheck] 🟢 Proxy IP matches — proxy ACTIVE")
             else:
                 print("[ProxyCheck] 🟡 Exit IP differs from proxy host (normal for rotating residential proxies)")
         except Exception:
             print(f"[ProxyCheck] Non-JSON response: {content[:200]}")
-
     except Exception as exc:
-        print(f"[ProxyCheck] Verification error (non-fatal): {exc}")
+        print(f"[ProxyCheck] Error (non-fatal): {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -245,13 +273,11 @@ async def _verify_proxy(browser_session, expected_proxy: dict) -> None:
 # ---------------------------------------------------------------------------
 
 async def _capsolver_solve(task: dict, proxy: dict | None = None) -> dict | None:
-    """Solve a CAPTCHA via CapSolver, optionally using the session proxy."""
     if not CAPSOLVER_API_KEY:
         print("[CapSolver] No API key — skipping")
         return None
 
-    # Shallow copy — never mutate the caller's dict
-    task = dict(task)
+    task = dict(task)  # shallow copy — never mutate caller's dict
 
     if proxy:
         task["proxyType"]     = "http"
@@ -270,7 +296,6 @@ async def _capsolver_solve(task: dict, proxy: dict | None = None) -> dict | None
                 print(f"[CapSolver] Error: {data.get('errorDescription')}")
                 return None
             task_id = data["taskId"]
-
         async with httpx.AsyncClient(timeout=120) as c:
             for _ in range(60):
                 await asyncio.sleep(2)
@@ -419,23 +444,36 @@ async def detect_and_solve_captcha(page) -> None:
 
 
 # ---------------------------------------------------------------------------
-# HUMAN-LIKE BEHAVIOUR
+# HUMAN-LIKE DELAY
 # ---------------------------------------------------------------------------
 
 async def human_delay(min_ms: int = 500, max_ms: int = 2000) -> None:
     await asyncio.sleep(random.uniform(min_ms / 1000, max_ms / 1000))
 
 
+# ---------------------------------------------------------------------------
+# STEALTH APPLICATION — uses unwrapped real page
+# ---------------------------------------------------------------------------
+
 async def apply_stealth_to_page(page) -> None:
+    """
+    Apply stealth to the page.
+    MUST unwrap the real Playwright page first — browser-use wrappers don't
+    have add_init_script, which causes playwright-stealth to crash every step.
+    """
+    real_page = await _unwrap_page(page)
+
     if STEALTH_LIB_AVAILABLE:
         try:
-            await _stealth_async(page)
+            await _stealth_async(real_page)
+            print("[Stealth] playwright-stealth applied ✅")
         except Exception as exc:
             print(f"[Stealth] playwright-stealth failed: {exc}")
+
     try:
-        await page.add_init_script(STEALTH_SCRIPT)
-    except Exception:
-        pass
+        await real_page.add_init_script(STEALTH_SCRIPT)
+    except Exception as exc:
+        print(f"[Stealth] add_init_script failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -531,7 +569,6 @@ def _dump_history_screenshots(history, folder: str) -> int:
                     break
     except Exception as exc:
         print(f"[History] Extraction failed: {exc}")
-
     return saved
 
 
@@ -615,37 +652,51 @@ RULE 4 — PROCEED AFTER CLOSE:
 
 
 # ---------------------------------------------------------------------------
-# STEP CALLBACK — stealth + captcha + screenshot
+# STEP CALLBACK
 # ---------------------------------------------------------------------------
 
 def make_screenshot_callback(folder: str, counter: list[int]):
+    proxy_checked = [False]  # verify proxy only once, on step 1
+
     async def _callback(agent) -> None:
         counter[0] += 1
         n = counter[0]
         try:
             browser_session = getattr(agent, "browser_session", None)
             if browser_session is None:
+                print(f"[Callback] step {n}: no browser_session")
                 return
             page = await browser_session.get_current_page()
             if page is None:
+                print(f"[Callback] step {n}: get_current_page() returned None")
                 return
 
+            # ── Step 1: verify proxy IP (browser is now definitely running) ──
+            if not proxy_checked[0]:
+                proxy_checked[0] = True
+                await _verify_proxy(page, _ACTIVE_PROXY)
+
+            # ── Stealth — unwraps real Playwright page internally ──────────
             await apply_stealth_to_page(page)
+
+            # ── CAPTCHA check ─────────────────────────────────────────────
             await detect_and_solve_captcha(page)
+
+            # ── Human-like pacing ─────────────────────────────────────────
             await human_delay(300, 1200)
 
-            # page.screenshot() returns raw bytes — do NOT base64.b64decode()
+            # ── Screenshot — page.screenshot() returns raw bytes ──────────
             img_bytes = await page.screenshot()
             if isinstance(img_bytes, str):
-                # defensive: some wrappers return base64 string
-                img_bytes = base64.b64decode(img_bytes)
+                img_bytes = base64.b64decode(img_bytes)  # defensive
 
             path = os.path.join(folder, f"step_{n:04d}_cb.png")
             with open(path, "wb") as fh:
                 fh.write(img_bytes)
             print(f"[Callback] step {n:03d} → {path}")
+
         except Exception as exc:
-            print(f"[Callback] step {n} screenshot failed: {exc}")
+            print(f"[Callback] step {n} error: {exc}")
 
     return _callback
 
@@ -707,7 +758,6 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
     folder_name = f"{SCAN_DIR}/{timestamp}_{session_id}"
     os.makedirs(folder_name, exist_ok=True)
 
-    # Pick ONE proxy for this entire session — browser + CapSolver both use it
     _ACTIVE_PROXY = _pick_proxy()
 
     print(f"\n{'='*60}")
@@ -735,7 +785,6 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
     browser = None
     if BrowserConfig is not None and Browser is not None:
         try:
-            # Use dict format — plain URL string is silently ignored by Playwright
             proxy_dict = _proxy_browser_dict(_ACTIVE_PROXY)
             print(f"[Proxy] Browser proxy server : {proxy_dict['server']}")
             print(f"[Proxy] Browser proxy user   : {proxy_dict['username']}")
@@ -757,10 +806,8 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
                     "--no-default-browser-check",
                     "--password-store=basic",
                     "--use-mock-keychain",
-                    # NOTE: --single-process, --disable-extensions, --no-zygote intentionally
-                    # REMOVED. Those flags disable Chromium's internal proxy auth handler,
-                    # causing authenticated residential proxies to silently fail —
-                    # the browser falls back to the server's real IP.
+                    # --single-process / --disable-extensions / --no-zygote
+                    # intentionally omitted — they break Chromium proxy auth
                     '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                     'AppleWebKit/537.36 (KHTML, like Gecko) '
                     'Chrome/131.0.0.0 Safari/537.36',
@@ -774,42 +821,25 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
 
     agent        = Agent(**agent_kwargs)
     result_text  = ""
-    final_status = "success"
     history      = None
 
     try:
-        # ── PROXY VERIFICATION ────────────────────────────────────────────
-        # browser_session is lazily initialised inside agent.run(), so we
-        # run the actual task first, then check IP in step 1 via the callback.
-        # For an eager check, we attempt it here but don't block on failure.
-        try:
-            browser_session = getattr(agent, "browser_session", None)
-            if browser_session is not None:
-                await _verify_proxy(browser_session, _ACTIVE_PROXY)
-            else:
-                print("[ProxyCheck] browser_session not yet ready — IP will be logged at step 1")
-        except Exception as exc:
-            print(f"[ProxyCheck] Pre-run check skipped: {exc}")
-
         history     = await agent.run(max_steps=request.max_steps, on_step_end=on_step_end)
         result_text = ""
         try:
             all_results = history.all_results or []
-
             for action in reversed(all_results):
                 if getattr(action, 'is_done', False):
                     raw = getattr(action, 'extracted_content', '') or ''
                     if raw:
                         result_text = raw
                         break
-
             if not result_text:
                 for out in reversed(history.all_model_outputs or []):
                     done_block = out.get('done', {}) if isinstance(out, dict) else {}
                     if done_block.get('text'):
                         result_text = done_block['text']
                         break
-
             if not result_text:
                 skip = ('🔗', '🔍', 'Clicked', 'Typed', 'Waited', 'Scrolled', 'Searched')
                 for action in reversed(all_results):
@@ -835,8 +865,7 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
     except Exception as exc:
         import traceback
         traceback.print_exc()
-        result_text  = f"Agent error: {exc}"
-        final_status = "failed"
+        result_text = f"Agent error: {exc}"
         print(f"[Agent] ❌ Failed: {exc}")
 
     finally:
