@@ -49,9 +49,109 @@ os.makedirs(SCAN_DIR, exist_ok=True)
 
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
 
+# ---------------------------------------------------------------------------
+# RESIDENTIAL PROXY POOL — rotate per session for max stealth
+# Load from env vars (PROXY_1..PROXY_N) or fall back to hardcoded list.
+# Format: host:port:user:pass
+# ---------------------------------------------------------------------------
+
+_PROXY_LIST_DEFAULT = [
+    {"host": os.getenv("PROXY_1_HOST", "104.252.62.99"),  "port": os.getenv("PROXY_1_PORT", "5470"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
+    {"host": os.getenv("PROXY_2_HOST", "45.248.55.14"),   "port": os.getenv("PROXY_2_PORT", "6600"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
+    {"host": os.getenv("PROXY_3_HOST", "103.130.178.57"), "port": os.getenv("PROXY_3_PORT", "5721"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
+    {"host": os.getenv("PROXY_4_HOST", "82.22.181.141"),  "port": os.getenv("PROXY_4_PORT", "7852"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
+    {"host": os.getenv("PROXY_5_HOST", "192.46.188.160"), "port": os.getenv("PROXY_5_PORT", "5819"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
+]
+
+_proxy_index = 0
+_proxy_lock  = asyncio.Lock()
+
+async def _get_next_proxy() -> dict:
+    """Round-robin proxy rotation — picks a different proxy each session."""
+    global _proxy_index
+    async with _proxy_lock:
+        proxy = _PROXY_LIST_DEFAULT[_proxy_index % len(_PROXY_LIST_DEFAULT)]
+        _proxy_index += 1
+        return proxy
+
+def _proxy_server_url(proxy: dict) -> str:
+    """Returns http://user:pass@host:port format for Playwright."""
+    return f"http://{proxy['user']}:{proxy['pass']}@{proxy['host']}:{proxy['port']}"
+
+def _capsolver_proxy_config(proxy: dict) -> dict:
+    """Returns CapSolver proxy fields for non-ProxyLess task types."""
+    return {
+        "proxyType": "http",
+        "proxyAddress": proxy["host"],
+        "proxyPort":    int(proxy["port"]),
+        "proxyLogin":   proxy["user"],
+        "proxyPassword": proxy["pass"],
+    }
+
+# ---------------------------------------------------------------------------
+# RESIDENTIAL PROXY POOL — rotates per session
+# ---------------------------------------------------------------------------
+PROXY_POOL = [
+    {"host": "104.252.62.99",  "port": "5470", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
+    {"host": "45.248.55.14",   "port": "6600", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
+    {"host": "103.130.178.57", "port": "5721", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
+    {"host": "82.22.181.141",  "port": "7852", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
+    {"host": "192.46.188.160", "port": "5819", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
+]
+
+_ACTIVE_PROXY: dict = PROXY_POOL[0]  # set per-session in run_agent
+
+
+def _pick_proxy() -> dict:
+    """Pick a random proxy from the pool each session."""
+    p = random.choice(PROXY_POOL)
+    return {
+        "server":   f"http://{p['host']}:{p['port']}",
+        "username": p["user"],
+        "password": p["pass"],
+    }
+
+# ---------------------------------------------------------------------------
+# RESIDENTIAL PROXY POOL
+# ---------------------------------------------------------------------------
+PROXY_POOL = [
+    {"host": "104.252.62.99",  "port": "5470", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
+    {"host": "45.248.55.14",   "port": "6600", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
+    {"host": "103.130.178.57", "port": "5721", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
+    {"host": "82.22.181.141",  "port": "7852", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
+    {"host": "192.46.188.160", "port": "5819", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
+]
+
+_ACTIVE_PROXY: dict = PROXY_POOL[0]  # set per-session in run_agent
+
+
+def _pick_proxy() -> dict:
+    """Pick a random proxy from the pool each session."""
+    return random.choice(PROXY_POOL)
+
+def _proxy_url(p: dict) -> str:
+    """Return http://user:pass@host:port string."""
+    return f"http://{p['user']}:{p['pass']}@{p['host']}:{p['port']}"
+
 # Persistent browser profile — reuses cookies/localStorage across sessions
 PROFILE_DIR = os.path.join(os.getcwd(), "browser_profile")
 os.makedirs(PROFILE_DIR, exist_ok=True)
+
+# Residential proxies — rotated randomly per session
+PROXIES = [
+    {"host": "104.252.62.99",  "port": "5470", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
+    {"host": "45.248.55.14",   "port": "6600", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
+    {"host": "103.130.178.57", "port": "5721", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
+    {"host": "82.22.181.141",  "port": "7852", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
+    {"host": "192.46.188.160", "port": "5819", "user": "hgfumqbe", "pass": "t8a93hs91l3r"},
+]
+
+_ACTIVE_PROXY: dict = PROXY_POOL[0]  # set per-session in run_agent
+
+
+def _pick_proxy() -> dict:
+    """Pick a random proxy from the pool each session."""
+    return random.choice(PROXIES)
 
 # playwright-stealth — fixes TLS fingerprint + deeper signals
 try:
@@ -100,9 +200,25 @@ WebGLRenderingContext.prototype.getParameter = function(p) {
 """
 
 
-async def _capsolver_solve(task: dict) -> dict | None:
+async def _capsolver_solve(task: dict, proxy: dict | None = None) -> dict | None:
+    """
+    Solve a CAPTCHA via CapSolver.
+    If a proxy dict is provided, injects it into the task for proxy-based solving
+    (higher success rate than ProxyLess).
+    """
     if not CAPSOLVER_API_KEY:
         return None
+
+    # Inject proxy into task if provided — upgrades ProxyLess → proxy task type
+    if proxy:
+        task["proxyType"] = "http"
+        task["proxyAddress"] = proxy["host"]
+        task["proxyPort"] = int(proxy["port"])
+        task["proxyLogin"] = proxy["user"]
+        task["proxyPassword"] = proxy["pass"]
+        # Rename ProxyLess task types to proxy-based equivalents
+        task["type"] = task["type"].replace("ProxyLess", "")
+
     try:
         async with httpx.AsyncClient(timeout=30) as c:
             r = await c.post("https://api.capsolver.com/createTask",
@@ -152,8 +268,10 @@ async def detect_and_solve_captcha(page) -> None:
                 ts_key = m.group(1)
         if ts_key:
             print(f"[CAPTCHA] Turnstile detected — solving…")
-            sol = await _capsolver_solve({"type": "AntiTurnstileTaskProxyLess",
-                                          "websiteURL": page_url, "websiteKey": ts_key})
+            sol = await _capsolver_solve({"type": "AntiTurnstileTask",
+                                          "websiteURL": page_url, "websiteKey": ts_key,
+                                          "proxyType": "http", "proxyAddress": _ACTIVE_PROXY["host"],
+                                          "proxyPort": int(_ACTIVE_PROXY["port"]), "proxyLogin": _ACTIVE_PROXY["user"], "proxyPassword": _ACTIVE_PROXY["pass"]})
             if sol:
                 token = sol.get("token", "")
                 await page.evaluate("""(t) => {
@@ -200,8 +318,10 @@ async def detect_and_solve_captcha(page) -> None:
             if m: rc_key = m.group(1)
         if rc_key and "6L" in rc_key:
             print("[CAPTCHA] reCAPTCHA v2 detected — solving…")
-            sol = await _capsolver_solve({"type": "ReCaptchaV2TaskProxyLess",
-                                          "websiteURL": page_url, "websiteKey": rc_key})
+            sol = await _capsolver_solve({"type": "ReCaptchaV2Task",
+                                          "websiteURL": page_url, "websiteKey": rc_key,
+                                          "proxyType": "http", "proxyAddress": _ACTIVE_PROXY["host"],
+                                          "proxyPort": int(_ACTIVE_PROXY["port"]), "proxyLogin": _ACTIVE_PROXY["user"], "proxyPassword": _ACTIVE_PROXY["pass"]})
             if sol:
                 token = sol.get("gRecaptchaResponse", "")
                 await page.evaluate("""(t) => {
@@ -222,8 +342,10 @@ async def detect_and_solve_captcha(page) -> None:
             m = _re.search(r'data-sitekey=["\']([^"\']+)["\']', html)
             if m:
                 print("[CAPTCHA] hCaptcha detected — solving…")
-                sol = await _capsolver_solve({"type": "HCaptchaTaskProxyLess",
-                                              "websiteURL": page_url, "websiteKey": m.group(1)})
+                sol = await _capsolver_solve({"type": "HCaptchaTask",
+                                              "websiteURL": page_url, "websiteKey": m.group(1),
+                                              "proxyType": "http", "proxyAddress": _ACTIVE_PROXY["host"],
+                                              "proxyPort": int(_ACTIVE_PROXY["port"]), "proxyLogin": _ACTIVE_PROXY["user"], "proxyPassword": _ACTIVE_PROXY["pass"]})
                 if sol:
                     token = sol.get("gRecaptchaResponse", "")
                     await page.evaluate("""(t) => {
@@ -617,10 +739,20 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
     )
 
     browser = None
+    # Set active proxy for this session (used by both browser + CapSolver)
+    global _ACTIVE_PROXY
+    _ACTIVE_PROXY = random.choice(PROXY_POOL)
+    print(f"[Proxy] Session proxy: {_ACTIVE_PROXY['host']}:{_ACTIVE_PROXY['port']}")
+
     if BrowserConfig is not None and Browser is not None:
         try:
+            proxy = _pick_proxy()
+            proxy_url = f"http://{proxy['user']}:{proxy['pass']}@{proxy['host']}:{proxy['port']}"
+            print(f"[Proxy] Using {proxy['host']}:{proxy['port']}")
+
             browser_cfg = BrowserConfig(
                 headless=True,
+                proxy=proxy_url,
                 extra_chromium_args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
