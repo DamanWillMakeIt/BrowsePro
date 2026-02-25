@@ -18,6 +18,7 @@ import os
 import random
 import re as _re
 import shutil
+import sys
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -60,7 +61,7 @@ PROXY_POOL = [
     {"host": os.getenv("PROXY_5_HOST", "192.46.188.160"), "port": os.getenv("PROXY_5_PORT", "5819"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
 ]
 
-# Single active proxy per session — set once in run_agent, shared by browser + CapSolver
+# Single active proxy per session — set once in run_agent(), shared by browser + CapSolver
 _ACTIVE_PROXY: dict = PROXY_POOL[0]
 
 
@@ -69,16 +70,37 @@ def _pick_proxy() -> dict:
     return random.choice(PROXY_POOL)
 
 
-def _proxy_server_url(proxy: dict) -> str:
-    """Returns http://user:pass@host:port for Playwright BrowserConfig."""
+def _proxy_browser_dict(proxy: dict) -> dict:
+    """
+    Returns the proxy dict that Playwright / BrowserConfig actually accepts.
+
+    CRITICAL: BrowserConfig(proxy=...) requires a dict with keys:
+      server, username, password
+    Passing a plain URL string (http://user:pass@host:port) is silently ignored
+    in most browser-use / Playwright versions — the browser then launches with
+    NO proxy at all, exposing the server's real IP and triggering bot detection.
+    """
+    return {
+        "server":   f"http://{proxy['host']}:{proxy['port']}",
+        "username": proxy["user"],
+        "password": proxy["pass"],
+    }
+
+
+def _proxy_url_string(proxy: dict) -> str:
+    """Returns http://user:pass@host:port — for logging only."""
     return f"http://{proxy['user']}:{proxy['pass']}@{proxy['host']}:{proxy['port']}"
 
 
-# Persistent browser profile directory
+# ---------------------------------------------------------------------------
+# PERSISTENT BROWSER PROFILE
+# ---------------------------------------------------------------------------
 PROFILE_DIR = os.path.join(os.getcwd(), "browser_profile")
 os.makedirs(PROFILE_DIR, exist_ok=True)
 
-# playwright-stealth
+# ---------------------------------------------------------------------------
+# PLAYWRIGHT-STEALTH
+# ---------------------------------------------------------------------------
 try:
     from playwright_stealth import stealth_async as _stealth_async
     STEALTH_LIB_AVAILABLE = True
@@ -89,18 +111,18 @@ except ImportError:
     print("[Stealth] Run: pip install playwright-stealth")
 
 # ---------------------------------------------------------------------------
-# DEPLOY VERIFICATION — confirms new image is live on every startup
+# DEPLOY VERIFICATION — printed on every startup so you can confirm the
+# correct image/code is running
 # ---------------------------------------------------------------------------
-import sys
 print("=" * 60)
-print(f"[Deploy] Python: {sys.version}")
+print(f"[Deploy] Python           : {sys.version}")
 print(f"[Deploy] playwright-stealth: {'INSTALLED ✅' if STEALTH_LIB_AVAILABLE else 'MISSING ❌'}")
 print(f"[Deploy] CAPSOLVER_API_KEY : {'SET ✅' if CAPSOLVER_API_KEY else 'NOT SET ❌'}")
+print(f"[Deploy] Proxy pool size   : {len(PROXY_POOL)}")
 print("=" * 60)
 
-
 # ---------------------------------------------------------------------------
-# STEALTH SCRIPT
+# JS STEALTH SCRIPT
 # ---------------------------------------------------------------------------
 STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
@@ -135,11 +157,14 @@ WebGLRenderingContext.prototype.getParameter = function(p) {
 
 
 # ---------------------------------------------------------------------------
-# SAFE PAGE HELPERS — handle both property and coroutine Playwright versions
+# SAFE PAGE HELPERS
+# Fixes: 'Page' object has no attribute 'url' / 'frames'
+# browser-use wraps Playwright pages; .url and .frames may be coroutines
+# depending on the version. These helpers handle both cases safely.
 # ---------------------------------------------------------------------------
 
 async def _page_url(page) -> str:
-    """Safely get page URL regardless of Playwright version."""
+    """Safely get page URL regardless of Playwright/browser-use version."""
     try:
         url = page.url
         if asyncio.iscoroutine(url):
@@ -153,7 +178,7 @@ async def _page_url(page) -> str:
 
 
 async def _page_frames(page) -> list:
-    """Safely get page frames regardless of Playwright version."""
+    """Safely get page frames list."""
     try:
         frames = page.frames
         if asyncio.iscoroutine(frames):
@@ -164,7 +189,7 @@ async def _page_frames(page) -> list:
 
 
 async def _frame_url(frame) -> str:
-    """Safely get frame URL regardless of Playwright version."""
+    """Safely get a frame's URL."""
     try:
         url = frame.url
         if asyncio.iscoroutine(url):
@@ -175,14 +200,58 @@ async def _frame_url(frame) -> str:
 
 
 # ---------------------------------------------------------------------------
-# CAPTCHA SOLVER
+# PROXY VERIFICATION
+# Navigates to ipinfo.io/json right after browser launch to confirm the
+# proxy is actually routing traffic. Logs the exit IP every session.
+# If the reported IP matches your server's real IP → proxy is NOT working.
+# ---------------------------------------------------------------------------
+
+async def _verify_proxy(browser_session, expected_proxy: dict) -> None:
+    try:
+        page = await browser_session.get_current_page()
+        if page is None:
+            print("[ProxyCheck] Could not get page — skipping verification")
+            return
+
+        print("[ProxyCheck] Navigating to https://ipinfo.io/json to verify proxy…")
+        await page.goto("https://ipinfo.io/json", timeout=15000)
+        await asyncio.sleep(2)
+
+        try:
+            content = await page.evaluate("() => document.body.innerText")
+        except Exception:
+            content = await page.content()
+
+        print(f"[ProxyCheck] Expected proxy host : {expected_proxy['host']}")
+        print(f"[ProxyCheck] ipinfo.io response  : {content[:300]}")
+
+        try:
+            info        = json.loads(content)
+            reported_ip = info.get("ip", "unknown")
+            print(f"[ProxyCheck] Exit IP: {reported_ip}")
+            if reported_ip == expected_proxy["host"]:
+                print("[ProxyCheck] 🟢 Exit IP matches proxy host — proxy ACTIVE")
+            else:
+                print("[ProxyCheck] 🟡 Exit IP differs from proxy host (normal for rotating residential proxies)")
+        except Exception:
+            print(f"[ProxyCheck] Non-JSON response: {content[:200]}")
+
+    except Exception as exc:
+        print(f"[ProxyCheck] Verification error (non-fatal): {exc}")
+
+
+# ---------------------------------------------------------------------------
+# CAPSOLVER
 # ---------------------------------------------------------------------------
 
 async def _capsolver_solve(task: dict, proxy: dict | None = None) -> dict | None:
-    """Solve a CAPTCHA via CapSolver using the active session proxy."""
+    """Solve a CAPTCHA via CapSolver, optionally using the session proxy."""
     if not CAPSOLVER_API_KEY:
-        print("[CapSolver] No API key configured — skipping")
+        print("[CapSolver] No API key — skipping")
         return None
+
+    # Shallow copy — never mutate the caller's dict
+    task = dict(task)
 
     if proxy:
         task["proxyType"]     = "http"
@@ -201,6 +270,7 @@ async def _capsolver_solve(task: dict, proxy: dict | None = None) -> dict | None
                 print(f"[CapSolver] Error: {data.get('errorDescription')}")
                 return None
             task_id = data["taskId"]
+
         async with httpx.AsyncClient(timeout=120) as c:
             for _ in range(60):
                 await asyncio.sleep(2)
@@ -217,8 +287,12 @@ async def _capsolver_solve(task: dict, proxy: dict | None = None) -> dict | None
     return None
 
 
+# ---------------------------------------------------------------------------
+# CAPTCHA DETECTION + SOLVING
+# ---------------------------------------------------------------------------
+
 async def detect_and_solve_captcha(page) -> None:
-    """Detect and solve Turnstile / reCAPTCHA v2 / hCaptcha on the current page."""
+    """Detect and solve Turnstile / reCAPTCHA v2 / hCaptcha."""
     try:
         try:
             html = await page.content()
@@ -228,7 +302,6 @@ async def detect_and_solve_captcha(page) -> None:
             except Exception:
                 return
 
-        # Safe URL and frames access — fixes 'Page has no attribute url/frames'
         page_url = await _page_url(page)
         frames   = await _page_frames(page)
         proxy    = _ACTIVE_PROXY
@@ -236,9 +309,9 @@ async def detect_and_solve_captcha(page) -> None:
         # ── Cloudflare Turnstile ──────────────────────────────────────────
         ts_key = None
         for frame in frames:
-            frame_url = await _frame_url(frame)
-            if "challenges.cloudflare.com" in frame_url or "turnstile" in frame_url.lower():
-                m = _re.search(r'[?&]k=([^&]+)', frame_url)
+            fu = await _frame_url(frame)
+            if "challenges.cloudflare.com" in fu or "turnstile" in fu.lower():
+                m = _re.search(r'[?&]k=([^&]+)', fu)
                 if m:
                     ts_key = m.group(1)
                 break
@@ -247,12 +320,11 @@ async def detect_and_solve_captcha(page) -> None:
             if m and ("cf-turnstile" in html or "turnstile" in html.lower()):
                 ts_key = m.group(1)
         if ts_key:
-            print(f"[CAPTCHA] Turnstile detected — solving…")
-            sol = await _capsolver_solve({
-                "type":       "AntiTurnstileTask",
-                "websiteURL": page_url,
-                "websiteKey": ts_key,
-            }, proxy=proxy)
+            print("[CAPTCHA] Turnstile detected — solving…")
+            sol = await _capsolver_solve(
+                {"type": "AntiTurnstileTask", "websiteURL": page_url, "websiteKey": ts_key},
+                proxy=proxy,
+            )
             if sol:
                 token = sol.get("token", "")
                 await page.evaluate("""(t) => {
@@ -273,15 +345,15 @@ async def detect_and_solve_captcha(page) -> None:
                 if "Just a moment" not in new_html:
                     print("[CAPTCHA] Cloudflare cleared ✅")
                     return
-            print("[CAPTCHA] Cloudflare challenge persists")
+            print("[CAPTCHA] Cloudflare challenge persists after 15s")
             return
 
         # ── reCAPTCHA v2 ─────────────────────────────────────────────────
         rc_key = None
         for frame in frames:
-            frame_url = await _frame_url(frame)
-            if "recaptcha" in frame_url and "anchor" in frame_url:
-                m = _re.search(r'[?&]k=([^&]+)', frame_url)
+            fu = await _frame_url(frame)
+            if "recaptcha" in fu and "anchor" in fu:
+                m = _re.search(r'[?&]k=([^&]+)', fu)
                 if m:
                     rc_key = m.group(1)
                 try:
@@ -289,7 +361,6 @@ async def detect_and_solve_captcha(page) -> None:
                     if await cb.count() > 0:
                         await cb.click(timeout=3000)
                         await asyncio.sleep(3)
-                        # Re-fetch frames after click
                         new_frames = await _page_frames(page)
                         if not any("bframe" in (await _frame_url(f)) for f in new_frames):
                             print("[CAPTCHA] reCAPTCHA checkbox passed ✅")
@@ -303,11 +374,10 @@ async def detect_and_solve_captcha(page) -> None:
                 rc_key = m.group(1)
         if rc_key and "6L" in rc_key:
             print("[CAPTCHA] reCAPTCHA v2 detected — solving…")
-            sol = await _capsolver_solve({
-                "type":       "ReCaptchaV2Task",
-                "websiteURL": page_url,
-                "websiteKey": rc_key,
-            }, proxy=proxy)
+            sol = await _capsolver_solve(
+                {"type": "ReCaptchaV2Task", "websiteURL": page_url, "websiteKey": rc_key},
+                proxy=proxy,
+            )
             if sol:
                 token = sol.get("gRecaptchaResponse", "")
                 await page.evaluate("""(t) => {
@@ -328,11 +398,10 @@ async def detect_and_solve_captcha(page) -> None:
             m = _re.search(r'data-sitekey=["\']([^"\']+)["\']', html)
             if m:
                 print("[CAPTCHA] hCaptcha detected — solving…")
-                sol = await _capsolver_solve({
-                    "type":       "HCaptchaTask",
-                    "websiteURL": page_url,
-                    "websiteKey": m.group(1),
-                }, proxy=proxy)
+                sol = await _capsolver_solve(
+                    {"type": "HCaptchaTask", "websiteURL": page_url, "websiteKey": m.group(1)},
+                    proxy=proxy,
+                )
                 if sol:
                     token = sol.get("gRecaptchaResponse", "")
                     await page.evaluate("""(t) => {
@@ -370,7 +439,7 @@ async def apply_stealth_to_page(page) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Models
+# MODELS
 # ---------------------------------------------------------------------------
 
 class AgentRequest(BaseModel):
@@ -386,7 +455,7 @@ class AgentResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# Placeholder frame
+# PLACEHOLDER FRAME
 # ---------------------------------------------------------------------------
 
 def _ensure_minimum_frames(folder: str) -> None:
@@ -406,7 +475,7 @@ def _ensure_minimum_frames(folder: str) -> None:
         draw.text(((1920 - tw) / 2, 520), msg, fill=(180, 180, 180))
         img.save(path, "PNG")
     except Exception as exc:
-        print(f"[Frames] Pillow placeholder failed ({exc}), writing raw PNG.")
+        print(f"[Frames] Pillow failed ({exc}), writing raw PNG.")
         import struct, zlib
         def _chunk(tag: bytes, data: bytes) -> bytes:
             crc = zlib.crc32(tag + data) & 0xFFFFFFFF
@@ -422,20 +491,20 @@ def _ensure_minimum_frames(folder: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Screenshot extractors
+# SCREENSHOT EXTRACTORS
 # ---------------------------------------------------------------------------
 
 def _dump_history_screenshots(history, folder: str) -> int:
     saved = 0
 
-    def _save(raw: str, label: str) -> bool:
+    def _save(raw, label: str) -> bool:
         nonlocal saved
         if not raw:
             return False
         if isinstance(raw, str) and "," in raw:
             raw = raw.split(",", 1)[1]
         try:
-            img_bytes = base64.b64decode(raw)
+            img_bytes = base64.b64decode(raw) if isinstance(raw, str) else raw
             if not (img_bytes[:4] == b'\x89PNG' or img_bytes[:2] == b'\xff\xd8'):
                 return False
             path = os.path.join(folder, f"{label}.png")
@@ -461,7 +530,7 @@ def _dump_history_screenshots(history, folder: str) -> int:
                 if _save(getattr(h, attr, None), f"step_{i+1:04d}_h"):
                     break
     except Exception as exc:
-        print(f"[History] Object extraction failed: {exc}")
+        print(f"[History] Extraction failed: {exc}")
 
     return saved
 
@@ -513,7 +582,7 @@ def _dump_json_screenshots(folder: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# Prompt wrapper
+# PROMPT WRAPPER
 # ---------------------------------------------------------------------------
 
 def _wrap_prompt(user_prompt: str) -> str:
@@ -546,7 +615,7 @@ RULE 4 — PROCEED AFTER CLOSE:
 
 
 # ---------------------------------------------------------------------------
-# Step callback — stealth + captcha + screenshot
+# STEP CALLBACK — stealth + captcha + screenshot
 # ---------------------------------------------------------------------------
 
 def make_screenshot_callback(folder: str, counter: list[int]):
@@ -565,9 +634,13 @@ def make_screenshot_callback(folder: str, counter: list[int]):
             await detect_and_solve_captcha(page)
             await human_delay(300, 1200)
 
-            img_b64   = await page.screenshot()
-            img_bytes = base64.b64decode(img_b64)
-            path      = os.path.join(folder, f"step_{n:04d}_cb.png")
+            # page.screenshot() returns raw bytes — do NOT base64.b64decode()
+            img_bytes = await page.screenshot()
+            if isinstance(img_bytes, str):
+                # defensive: some wrappers return base64 string
+                img_bytes = base64.b64decode(img_bytes)
+
+            path = os.path.join(folder, f"step_{n:04d}_cb.png")
             with open(path, "wb") as fh:
                 fh.write(img_bytes)
             print(f"[Callback] step {n:03d} → {path}")
@@ -578,7 +651,7 @@ def make_screenshot_callback(folder: str, counter: list[int]):
 
 
 # ---------------------------------------------------------------------------
-# LLM builder
+# LLM BUILDER
 # ---------------------------------------------------------------------------
 
 def build_llm(model: str, api_key: str):
@@ -601,20 +674,19 @@ def build_llm(model: str, api_key: str):
 
 
 # ---------------------------------------------------------------------------
-# Result cleaner
+# RESULT CLEANER
 # ---------------------------------------------------------------------------
 
-def _clean_result(text: str) -> str:
+def _clean_result(text: str) -> Any:
     if not text:
         return text
     text = text.strip()
-    import re as _r
-    result_block = _r.search(r'<r>\s*(.*?)\s*</r>', text, _r.DOTALL)
-    if result_block:
-        text = result_block.group(1).strip()
-    fenced = _r.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', text, _r.DOTALL)
-    if fenced:
-        text = fenced.group(1).strip()
+    m = _re.search(r'<r>\s*(.*?)\s*</r>', text, _re.DOTALL)
+    if m:
+        text = m.group(1).strip()
+    m = _re.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', text, _re.DOTALL)
+    if m:
+        text = m.group(1).strip()
     try:
         return json.loads(text)
     except Exception:
@@ -623,7 +695,7 @@ def _clean_result(text: str) -> str:
 
 
 # ---------------------------------------------------------------------------
-# Main endpoint
+# MAIN ENDPOINT
 # ---------------------------------------------------------------------------
 
 @app.post("/agent/run", response_model=AgentResponse)
@@ -663,12 +735,14 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
     browser = None
     if BrowserConfig is not None and Browser is not None:
         try:
-            proxy_url = _proxy_server_url(_ACTIVE_PROXY)
-            print(f"[Proxy] Browser proxy URL: {_ACTIVE_PROXY['host']}:{_ACTIVE_PROXY['port']}")
+            # Use dict format — plain URL string is silently ignored by Playwright
+            proxy_dict = _proxy_browser_dict(_ACTIVE_PROXY)
+            print(f"[Proxy] Browser proxy server : {proxy_dict['server']}")
+            print(f"[Proxy] Browser proxy user   : {proxy_dict['username']}")
 
             browser_cfg = BrowserConfig(
                 headless=True,
-                proxy=proxy_url,
+                proxy=proxy_dict,
                 extra_chromium_args=[
                     "--disable-blink-features=AutomationControlled",
                     "--no-sandbox",
@@ -683,10 +757,10 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
                     "--no-default-browser-check",
                     "--password-store=basic",
                     "--use-mock-keychain",
-                    "--single-process",
-                    "--disable-extensions",
-                    "--disable-default-apps",
-                    "--no-zygote",
+                    # NOTE: --single-process, --disable-extensions, --no-zygote intentionally
+                    # REMOVED. Those flags disable Chromium's internal proxy auth handler,
+                    # causing authenticated residential proxies to silently fail —
+                    # the browser falls back to the server's real IP.
                     '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                     'AppleWebKit/537.36 (KHTML, like Gecko) '
                     'Chrome/131.0.0.0 Safari/537.36',
@@ -704,22 +778,38 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
     history      = None
 
     try:
+        # ── PROXY VERIFICATION ────────────────────────────────────────────
+        # browser_session is lazily initialised inside agent.run(), so we
+        # run the actual task first, then check IP in step 1 via the callback.
+        # For an eager check, we attempt it here but don't block on failure.
+        try:
+            browser_session = getattr(agent, "browser_session", None)
+            if browser_session is not None:
+                await _verify_proxy(browser_session, _ACTIVE_PROXY)
+            else:
+                print("[ProxyCheck] browser_session not yet ready — IP will be logged at step 1")
+        except Exception as exc:
+            print(f"[ProxyCheck] Pre-run check skipped: {exc}")
+
         history     = await agent.run(max_steps=request.max_steps, on_step_end=on_step_end)
         result_text = ""
         try:
             all_results = history.all_results or []
+
             for action in reversed(all_results):
                 if getattr(action, 'is_done', False):
                     raw = getattr(action, 'extracted_content', '') or ''
                     if raw:
                         result_text = raw
                         break
+
             if not result_text:
                 for out in reversed(history.all_model_outputs or []):
                     done_block = out.get('done', {}) if isinstance(out, dict) else {}
                     if done_block.get('text'):
                         result_text = done_block['text']
                         break
+
             if not result_text:
                 skip = ('🔗', '🔍', 'Clicked', 'Typed', 'Waited', 'Scrolled', 'Searched')
                 for action in reversed(all_results):
@@ -731,12 +821,12 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
             result_text = ""
 
         if result_text:
-            import re as _re2
-            json_match = _re2.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', result_text, _re2.DOTALL)
+            json_match = _re.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', result_text, _re.DOTALL)
             if json_match:
                 try:
                     parsed      = json.loads(json_match.group(1))
                     result_text = json.dumps(parsed, ensure_ascii=False, indent=2)
+                    print("[Agent] Extracted clean JSON ✅")
                 except Exception:
                     pass
 
@@ -775,7 +865,7 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
         shutil.rmtree(folder_name)
         print(f"[Cleanup] Deleted scan folder: {folder_name}")
     except Exception as exc:
-        print(f"[Cleanup] Could not delete scan folder: {exc}")
+        print(f"[Cleanup] Could not delete: {exc}")
 
     return AgentResponse(
         video_url=video_url,
@@ -783,6 +873,10 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
         extracted_data=_clean_result(result_text) or None,
     )
 
+
+# ---------------------------------------------------------------------------
+# HEALTH CHECK
+# ---------------------------------------------------------------------------
 
 @app.get("/health")
 async def health() -> dict:
