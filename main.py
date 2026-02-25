@@ -253,7 +253,7 @@ async def detect_and_solve_captcha(page) -> None:
                 html = await page.evaluate("() => document.documentElement.outerHTML")
             except Exception:
                 return
-        page_url = page.url
+        page_url = await page.evaluate("() => window.location.href")
 
         # ── Cloudflare Turnstile ──────────────────────────────────────────
         ts_key = None
