@@ -30,6 +30,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 # Install uv
 RUN pip install uv
+# Cache-bust: change this value to force clean reinstall of all dependencies
+ARG CACHE_BUST=2
 # Install Python dependencies
 COPY requirements.txt .
 RUN uv pip install --system --no-cache -r requirements.txt
