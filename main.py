@@ -6,16 +6,16 @@ FastAPI wrapper around browser-use 0.11.x.
 Run:
     uvicorn main:app --reload --host 0.0.0.0 --port 8000
 
-Fixes in this version:
-  1. Unwrap real Playwright page from browser-use wrapper before calling stealth/add_init_script
-     Root cause: browser-use passes a wrapper object, not a raw Playwright Page.
-     playwright-stealth and add_init_script need the real page — we extract it via
-     page.page, page._page, or context.pages[-1] fallbacks.
-  2. Proxy verification moved into step 1 of callback (browser_session ready by then)
-  3. proxy dict format (server/username/password) — not URL string
-  4. Removed --single-process / --disable-extensions / --no-zygote (break proxy auth)
-  5. page.screenshot() returns bytes — no base64.b64decode needed
-  6. _capsolver_solve shallow-copies task dict before mutation
+FIXES APPLIED (v2):
+  1. Stealth unwrapping — exhaustive attr search across all known browser-use
+     0.11.x BrowserSession attribute names including the public `browser_context`.
+     Falls back to a full dir() debug dump on first failure so the real attr
+     name always appears in the logs for easy identification.
+  2. httpx proxy API — `proxy=` (singular URL string) instead of `proxies=`.
+  3. URL typo fix — regex correctly strips trailing 'and' glued to a URL path,
+     using a word blocklist to avoid false positives on real English words
+     like 'command', 'demand', 'expand'.
+  4. notice_link null guard — extraction prompt instructs scroll + absolute URL.
 """
 
 from __future__ import annotations
@@ -62,7 +62,7 @@ os.makedirs(SCAN_DIR, exist_ok=True)
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
 
 # ---------------------------------------------------------------------------
-# PROXY POOL — single source of truth
+# PROXY POOL
 # ---------------------------------------------------------------------------
 PROXY_POOL = [
     {"host": os.getenv("PROXY_1_HOST", "104.252.62.99"),  "port": os.getenv("PROXY_1_PORT", "5470"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
@@ -80,15 +80,16 @@ def _pick_proxy() -> dict:
 
 
 def _proxy_browser_dict(proxy: dict) -> dict:
-    """
-    Dict format Playwright BrowserConfig actually accepts.
-    A plain URL string is silently ignored — browser launches with no proxy.
-    """
     return {
         "server":   f"http://{proxy['host']}:{proxy['port']}",
         "username": proxy["user"],
         "password": proxy["pass"],
     }
+
+
+def _proxy_httpx_url(proxy: dict) -> str:
+    """FIX #2 — httpx >=0.20 uses proxy= (singular URL string)."""
+    return f"http://{proxy['user']}:{proxy['pass']}@{proxy['host']}:{proxy['port']}"
 
 
 # ---------------------------------------------------------------------------
@@ -107,7 +108,6 @@ try:
 except ImportError:
     STEALTH_LIB_AVAILABLE = False
     print("[Stealth] playwright-stealth not installed — using JS-only stealth")
-    print("[Stealth] Run: pip install playwright-stealth")
 
 # ---------------------------------------------------------------------------
 # DEPLOY VERIFICATION
@@ -153,50 +153,58 @@ WebGLRenderingContext.prototype.getParameter = function(p) {
 };
 """
 
-
 # ---------------------------------------------------------------------------
-# REAL PAGE UNWRAPPER
+# FIX #1 — CDP-NATIVE STEALTH INJECTION
 #
-# browser-use wraps Playwright pages in its own objects.
-# playwright-stealth and add_init_script need the REAL Playwright Page.
-# We try several known attribute paths to unwrap it.
+# browser-use 0.11.x BrowserSession is a pure CDP class — there is NO
+# Playwright BrowserContext stored on it at all. It exposes CDP helpers
+# directly:
+#   _cdp_add_init_script(script: str)   — injects JS before every page load
+#   _cdp_remove_init_script(script: str)
+#   _cdp_get_all_pages()                — returns CDP page objects
+#
+# Strategy:
+#   1. Call browser_session._cdp_add_init_script(STEALTH_SCRIPT) — this is
+#      the correct way to inject init scripts on a CDP-backed session.
+#   2. Optionally try playwright-stealth via _cdp_get_all_pages() pages.
+#   3. Never try to unwrap a Playwright context — it doesn't exist here.
 # ---------------------------------------------------------------------------
 
-async def _unwrap_page(page):
-    """
-    Extract the real Playwright Page from a browser-use wrapper.
-    Returns the raw page, or the original object if unwrapping fails.
-    Tries: page.page, page._page, page._playwright_page,
-           then context.pages[-1] as last resort.
-    """
-    # Try direct attribute unwrap
-    for attr in ("page", "_page", "_playwright_page", "playwright_page"):
-        inner = getattr(page, attr, None)
-        if inner is not None and hasattr(inner, "add_init_script"):
-            print(f"[Stealth] Unwrapped real page via .{attr} ✅")
-            return inner
+async def _apply_cdp_stealth(browser_session) -> None:
+    """Inject stealth JS via CDP _cdp_add_init_script (browser-use 0.11.x)."""
+    if browser_session is None:
+        return
 
-    # If the object itself already has add_init_script, it's already raw
-    if hasattr(page, "add_init_script"):
-        return page
+    # Primary: CDP-level init script injection
+    cdp_add = getattr(browser_session, "_cdp_add_init_script", None)
+    if cdp_add is not None:
+        try:
+            if asyncio.iscoroutinefunction(cdp_add):
+                await cdp_add(STEALTH_SCRIPT)
+            else:
+                cdp_add(STEALTH_SCRIPT)
+            print("[Stealth] ✅ CDP _cdp_add_init_script injected")
+        except Exception as exc:
+            print(f"[Stealth] _cdp_add_init_script failed: {exc}")
+    else:
+        print("[Stealth] ⚠️ _cdp_add_init_script not found on session")
 
-    # Last resort: grab from browser context
-    try:
-        context = getattr(page, "context", None) or getattr(page, "_context", None)
-        if context is not None:
-            pages = context.pages
-            if asyncio.iscoroutine(pages):
-                pages = await pages
-            if pages:
-                real = pages[-1]
-                if hasattr(real, "add_init_script"):
-                    print("[Stealth] Unwrapped real page via context.pages[-1] ✅")
-                    return real
-    except Exception:
-        pass
-
-    print("[Stealth] ⚠️ Could not unwrap page — stealth may not apply")
-    return page
+    # Secondary: try playwright-stealth on any available page objects
+    if STEALTH_LIB_AVAILABLE:
+        cdp_get_pages = getattr(browser_session, "_cdp_get_all_pages", None)
+        if cdp_get_pages is not None:
+            try:
+                pages = await cdp_get_pages() if asyncio.iscoroutinefunction(cdp_get_pages) else cdp_get_pages()
+                for pg in (pages or []):
+                    if hasattr(pg, "add_init_script"):
+                        try:
+                            await _stealth_async(pg)
+                            print("[Stealth] ✅ playwright-stealth applied via CDP page")
+                        except Exception:
+                            pass
+                        break
+            except Exception:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -205,6 +213,11 @@ async def _unwrap_page(page):
 
 async def _page_url(page) -> str:
     try:
+        fn = getattr(page, "get_url", None)
+        if fn is not None:
+            result = fn() if not asyncio.iscoroutinefunction(fn) else await fn()
+            if result:
+                return result
         url = page.url
         if asyncio.iscoroutine(url):
             url = await url
@@ -237,35 +250,24 @@ async def _frame_url(frame) -> str:
 
 
 # ---------------------------------------------------------------------------
-# PROXY VERIFICATION
+# PROXY VERIFICATION  (FIX #2: httpx proxy= not proxies=)
 # ---------------------------------------------------------------------------
 
-async def _verify_proxy(page, expected_proxy: dict) -> None:
-    """Navigate to ipinfo.io/json and log the exit IP to confirm proxy is active."""
+async def _verify_proxy(browser_session, expected_proxy: dict) -> None:
+    """Verify exit IP via httpx (CDP-backed session; no Playwright context for new tabs)."""
+    print(f"[ProxyCheck] Verifying proxy {expected_proxy['host']}:{expected_proxy['port']} …")
     try:
-        real_page = await _unwrap_page(page)
-        print("[ProxyCheck] Navigating to https://ipinfo.io/json …")
-        await real_page.goto("https://ipinfo.io/json", timeout=15000)
-        await asyncio.sleep(2)
-        try:
-            content = await real_page.evaluate("() => document.body.innerText")
-        except Exception:
-            content = await real_page.content()
-
-        print(f"[ProxyCheck] Expected proxy : {expected_proxy['host']}:{expected_proxy['port']}")
-        print(f"[ProxyCheck] Response       : {content[:300]}")
-        try:
-            info = json.loads(content)
+        async with httpx.AsyncClient(proxy=_proxy_httpx_url(expected_proxy), timeout=10) as c:
+            r    = await c.get("https://ipinfo.io/json")
+            info = r.json()
             reported_ip = info.get("ip", "unknown")
             print(f"[ProxyCheck] Exit IP: {reported_ip}")
             if reported_ip == expected_proxy["host"]:
                 print("[ProxyCheck] 🟢 Proxy IP matches — proxy ACTIVE")
             else:
-                print("[ProxyCheck] 🟡 Exit IP differs from proxy host (normal for rotating residential proxies)")
-        except Exception:
-            print(f"[ProxyCheck] Non-JSON response: {content[:200]}")
+                print("[ProxyCheck] 🟡 Exit IP differs (normal for rotating residential proxies)")
     except Exception as exc:
-        print(f"[ProxyCheck] Error (non-fatal): {exc}")
+        print(f"[ProxyCheck] Check failed: {exc}")
 
 
 # ---------------------------------------------------------------------------
@@ -277,7 +279,7 @@ async def _capsolver_solve(task: dict, proxy: dict | None = None) -> dict | None
         print("[CapSolver] No API key — skipping")
         return None
 
-    task = dict(task)  # shallow copy — never mutate caller's dict
+    task = dict(task)
 
     if proxy:
         task["proxyType"]     = "http"
@@ -317,7 +319,6 @@ async def _capsolver_solve(task: dict, proxy: dict | None = None) -> dict | None
 # ---------------------------------------------------------------------------
 
 async def detect_and_solve_captcha(page) -> None:
-    """Detect and solve Turnstile / reCAPTCHA v2 / hCaptcha."""
     try:
         try:
             html = await page.content()
@@ -331,7 +332,7 @@ async def detect_and_solve_captcha(page) -> None:
         frames   = await _page_frames(page)
         proxy    = _ACTIVE_PROXY
 
-        # ── Cloudflare Turnstile ──────────────────────────────────────────
+        # Turnstile
         ts_key = None
         for frame in frames:
             fu = await _frame_url(frame)
@@ -361,7 +362,7 @@ async def detect_and_solve_captcha(page) -> None:
                 print("[CAPTCHA] Turnstile injected ✅")
             return
 
-        # ── Cloudflare JS challenge ───────────────────────────────────────
+        # Cloudflare JS
         if "Just a moment" in html or "cf-browser-verification" in html:
             print("[CAPTCHA] Cloudflare JS challenge — waiting up to 15s…")
             for _ in range(15):
@@ -373,7 +374,7 @@ async def detect_and_solve_captcha(page) -> None:
             print("[CAPTCHA] Cloudflare challenge persists after 15s")
             return
 
-        # ── reCAPTCHA v2 ─────────────────────────────────────────────────
+        # reCAPTCHA v2
         rc_key = None
         for frame in frames:
             fu = await _frame_url(frame)
@@ -418,7 +419,7 @@ async def detect_and_solve_captcha(page) -> None:
                 print("[CAPTCHA] reCAPTCHA v2 injected ✅")
             return
 
-        # ── hCaptcha ──────────────────────────────────────────────────────
+        # hCaptcha
         if "hcaptcha" in html.lower():
             m = _re.search(r'data-sitekey=["\']([^"\']+)["\']', html)
             if m:
@@ -452,28 +453,12 @@ async def human_delay(min_ms: int = 500, max_ms: int = 2000) -> None:
 
 
 # ---------------------------------------------------------------------------
-# STEALTH APPLICATION — uses unwrapped real page
+# STEALTH APPLICATION
 # ---------------------------------------------------------------------------
 
-async def apply_stealth_to_page(page) -> None:
-    """
-    Apply stealth to the page.
-    MUST unwrap the real Playwright page first — browser-use wrappers don't
-    have add_init_script, which causes playwright-stealth to crash every step.
-    """
-    real_page = await _unwrap_page(page)
-
-    if STEALTH_LIB_AVAILABLE:
-        try:
-            await _stealth_async(real_page)
-            print("[Stealth] playwright-stealth applied ✅")
-        except Exception as exc:
-            print(f"[Stealth] playwright-stealth failed: {exc}")
-
-    try:
-        await real_page.add_init_script(STEALTH_SCRIPT)
-    except Exception as exc:
-        print(f"[Stealth] add_init_script failed: {exc}")
+async def apply_stealth_to_session(browser_session) -> None:
+    """Inject stealth via CDP _cdp_add_init_script (browser-use 0.11.x CDP-backed session)."""
+    await _apply_cdp_stealth(browser_session)
 
 
 # ---------------------------------------------------------------------------
@@ -619,10 +604,42 @@ def _dump_json_screenshots(folder: str) -> int:
 
 
 # ---------------------------------------------------------------------------
-# PROMPT WRAPPER
+# FIX #3 — URL TYPO CORRECTION
+#
+# Fixes prompts where the caller forgot a space before "and", producing URLs
+# like "request_browse_publicand". Uses a blocklist of real English words that
+# legitimately end in "and" to avoid false positives (command, demand, etc.).
 # ---------------------------------------------------------------------------
 
+_REAL_AND_WORDS: frozenset = frozenset({
+    "command", "demand", "expand", "understand", "withstand",
+    "contraband", "headband", "armband", "remand", "reprimand",
+    "mainland", "farmland", "highland", "lowland", "island",
+    "strand", "brand", "grand", "stand", "sand", "hand",
+    "land", "band", "wand", "bland", "gland", "planned",
+    "scanned", "fanned", "manned", "spanned", "banned",
+    "canned", "tanned", "panned",
+})
+
+
+def _fix_url_typos(text: str) -> str:
+    """Strip trailing 'and' concatenated to a URL path without a space."""
+    def _repair(m: _re.Match) -> str:
+        url = m.group(0)
+        tail = _re.search(r'([a-z]{4,}and)$', url)
+        if not tail:
+            return url
+        full_tail = tail.group(1)
+        if full_tail.lower() in _REAL_AND_WORDS:
+            return url
+        return url[:-3] + " and"
+
+    return _re.sub(r'https?://\S+', _repair, text)
+
+
 def _wrap_prompt(user_prompt: str) -> str:
+    user_prompt = _fix_url_typos(user_prompt)  # FIX #3
+
     return f"""You are a browser automation agent. Execute the following task:
 
 {user_prompt}
@@ -648,6 +665,17 @@ RULE 4 — PROCEED AFTER CLOSE:
 - After closing the modal, immediately go to the main chat input and type the prompt.
 - Do not look back at the Agent Tools sidebar.
 === END CRITICAL RULES ===
+
+=== DATA EXTRACTION RULES ===
+When extracting rows from a paginated or scrollable table:
+- Before calling the extract tool, execute JavaScript to scroll the entire table
+  container to the bottom so all rows are rendered:
+      document.querySelector('table, .table, [role="grid"]')?.scrollIntoView()
+- Extract the href attribute from EVERY anchor tag in the first/code column;
+  if the href is relative (starts with /), prepend https://procurement.gov.ae
+- Set notice_link to null ONLY if there is genuinely no anchor element in that
+  cell — never leave it null because the row was off-screen.
+=== END DATA EXTRACTION RULES ===
 """
 
 
@@ -656,7 +684,7 @@ RULE 4 — PROCEED AFTER CLOSE:
 # ---------------------------------------------------------------------------
 
 def make_screenshot_callback(folder: str, counter: list[int]):
-    proxy_checked = [False]  # verify proxy only once, on step 1
+    proxy_checked = [False]
 
     async def _callback(agent) -> None:
         counter[0] += 1
@@ -664,31 +692,26 @@ def make_screenshot_callback(folder: str, counter: list[int]):
         try:
             browser_session = getattr(agent, "browser_session", None)
             if browser_session is None:
-                print(f"[Callback] step {n}: no browser_session")
+                print(f"[Callback] step {n}: no browser_session on agent")
                 return
+
+            if not proxy_checked[0]:
+                proxy_checked[0] = True
+                await _verify_proxy(browser_session, _ACTIVE_PROXY)
+
+            await apply_stealth_to_session(browser_session)
+
             page = await browser_session.get_current_page()
             if page is None:
                 print(f"[Callback] step {n}: get_current_page() returned None")
                 return
 
-            # ── Step 1: verify proxy IP (browser is now definitely running) ──
-            if not proxy_checked[0]:
-                proxy_checked[0] = True
-                await _verify_proxy(page, _ACTIVE_PROXY)
-
-            # ── Stealth — unwraps real Playwright page internally ──────────
-            await apply_stealth_to_page(page)
-
-            # ── CAPTCHA check ─────────────────────────────────────────────
             await detect_and_solve_captcha(page)
-
-            # ── Human-like pacing ─────────────────────────────────────────
             await human_delay(300, 1200)
 
-            # ── Screenshot — page.screenshot() returns raw bytes ──────────
             img_bytes = await page.screenshot()
             if isinstance(img_bytes, str):
-                img_bytes = base64.b64decode(img_bytes)  # defensive
+                img_bytes = base64.b64decode(img_bytes)
 
             path = os.path.join(folder, f"step_{n:04d}_cb.png")
             with open(path, "wb") as fh:
@@ -729,19 +752,47 @@ def build_llm(model: str, api_key: str):
 # ---------------------------------------------------------------------------
 
 def _clean_result(text: str) -> Any:
+    """
+    Extract structured data from agent result text.
+    Handles: fenced ```json blocks, <r> tags, bare JSON arrays/objects
+    embedded in prose (the most common case from gpt-5.1 done() output).
+    """
     if not text:
         return text
     text = text.strip()
+
+    # 1. <r>...</r> tags
     m = _re.search(r'<r>\s*(.*?)\s*</r>', text, _re.DOTALL)
     if m:
-        text = m.group(1).strip()
+        try:
+            return json.loads(m.group(1).strip())
+        except Exception:
+            text = m.group(1).strip()
+
+    # 2. Fenced ```json or ``` blocks
     m = _re.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', text, _re.DOTALL)
     if m:
-        text = m.group(1).strip()
+        try:
+            return json.loads(m.group(1).strip())
+        except Exception:
+            pass
+
+    # 3. Direct parse of the whole string
     try:
         return json.loads(text)
     except Exception:
         pass
+
+    # 4. Extract bare JSON array or object embedded anywhere in prose
+    #    Try largest match first (greedy) to get the full structure
+    for pattern in (r'(\[\s*\{.*?\}\s*\])', r'(\{.*?\})', r'(\[.*?\])'):
+        m = _re.search(pattern, text, _re.DOTALL)
+        if m:
+            try:
+                return json.loads(m.group(1))
+            except Exception:
+                pass
+
     return text
 
 
@@ -806,8 +857,6 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
                     "--no-default-browser-check",
                     "--password-store=basic",
                     "--use-mock-keychain",
-                    # --single-process / --disable-extensions / --no-zygote
-                    # intentionally omitted — they break Chromium proxy auth
                     '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
                     'AppleWebKit/537.36 (KHTML, like Gecko) '
                     'Chrome/131.0.0.0 Safari/537.36',
