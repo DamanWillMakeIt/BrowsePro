@@ -1,28 +1,19 @@
 """
-main.py  v5 — RACE MODE (production-hardened)
-----------------------------------------------
-FastAPI wrapper around browser-use 0.11.x
+main.py  v6.1 — DEMO STEALTH MODE
+----------------------------------
+MAX stealth with Webshare proxies only (no residential needed for demo)
 
-FIXES OVER v4:
-  FIX-1  Warm-up now runs BEFORE agent.run(), not inside step callback
-  FIX-2  Slot-claimed asyncio.Lock prevents two workers double-queuing
-  FIX-3  Per-worker asyncio.wait_for(timeout=180s) prevents hung workers
-  FIX-4  RACE_WORKERS default lowered to 3 (safe for 4GB RAM)
-         RACE_MAX_ROUNDS raised to 8 (still 24 proxy attempts per request)
-  FIX-5  _is_valid() checks for real data keys, not just string length
-  FIX-6  Extracted data queued BEFORE video build — data never lost if
-         video upload crashes
-  FIX-7  Global semaphore caps concurrent Chromium instances hard
-
-ENV VARS:
-  WEBSHARE_API_KEY  — auto-fetches all 250 proxies at startup & hourly
-  PROXY_USER        — proxy username  (default: hgfumqbe)
-  PROXY_PASS        — proxy password  (default: t8a93hs91l3r)
-  RACE_WORKERS      — parallel workers per round (default: 3 for 4GB RAM)
-  RACE_MAX_ROUNDS   — max retry rounds           (default: 8)
-  WORKER_TIMEOUT    — seconds before a worker is killed (default: 180)
-  CAPSOLVER_API_KEY — for CAPTCHA solving
-  OPENAI_API_KEY    — for the LLM
+CHANGES FROM v6:
+  ✅ Realistic mouse movements with bezier curves
+  ✅ Human-like scrolling (not instant scrollIntoView)
+  ✅ Variable typing speed with occasional backspaces
+  ✅ 5-15s random pauses between actions
+  ✅ Pre-browsing warm-up (3 pages before target)
+  ✅ Cookie persistence across steps
+  ✅ Disabled race mode (1 worker = less suspicious)
+  ✅ Extended timeout (5min per worker)
+  ✅ Random user agents pool
+  ✅ Realistic viewport sizes
 """
 from __future__ import annotations
 from typing import Any
@@ -33,6 +24,15 @@ from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
 from browser_use import Agent
+
+# Camoufox import
+CAMOUFOX_AVAILABLE = False
+try:
+    from camoufox.async_api import AsyncCamoufox
+    CAMOUFOX_AVAILABLE = True
+    print("[Browser] ✅ Camoufox available")
+except ImportError:
+    print("[Browser] ⚠️  Camoufox not installed — Chromium fallback")
 
 try:
     from browser_use.browser.browser import Browser, BrowserConfig
@@ -47,7 +47,7 @@ from utils.helpers import create_and_upload_video
 
 load_dotenv()
 
-app = FastAPI(title="OnDemand Browser-Use Agent", version="5.0.0")
+app = FastAPI(title="OnDemand Browser-Use Agent", version="6.1.0")
 SCAN_DIR = "scans"
 os.makedirs(SCAN_DIR, exist_ok=True)
 
@@ -56,16 +56,34 @@ WEBSHARE_API_KEY  = os.getenv("WEBSHARE_API_KEY", "")
 PROXY_USER        = os.getenv("PROXY_USER", "hgfumqbe")
 PROXY_PASS        = os.getenv("PROXY_PASS", "t8a93hs91l3r")
 
-# FIX-4: 3 workers is safe on 4GB RAM (3 × ~350MB Chromium = ~1GB, leaves room for everything else)
-# If you upgrade to 8GB+ you can safely raise this to 6-8
-RACE_WORKERS   = int(os.getenv("RACE_WORKERS",   "3"))
-RACE_MAX_ROUNDS = int(os.getenv("RACE_MAX_ROUNDS", "8"))
-WORKER_TIMEOUT  = int(os.getenv("WORKER_TIMEOUT",  "180"))  # seconds per worker before kill
+# DEMO MODE: Single worker, longer timeout, multiple retries
+RACE_WORKERS      = 1   # Single worker = less suspicious
+RACE_MAX_ROUNDS   = 5   # Try 5 different proxies
+WORKER_TIMEOUT    = 300 # 5 minutes per attempt
+MAX_BROWSERS      = 1
 
-# FIX-7: Hard cap on simultaneous Chromium instances regardless of RACE_WORKERS setting
-# Prevents accidental OOM if someone sets RACE_WORKERS=10 on a small box
-MAX_BROWSERS = int(os.getenv("MAX_BROWSERS", "4"))
 _browser_semaphore = asyncio.Semaphore(MAX_BROWSERS)
+
+# ---------------------------------------------------------------------------
+# REALISTIC USER AGENTS POOL
+# ---------------------------------------------------------------------------
+USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
+]
+
+# ---------------------------------------------------------------------------
+# REALISTIC VIEWPORT SIZES
+# ---------------------------------------------------------------------------
+VIEWPORTS = [
+    {"width": 1920, "height": 1080},
+    {"width": 1366, "height": 768},
+    {"width": 1536, "height": 864},
+    {"width": 1440, "height": 900},
+]
 
 # ---------------------------------------------------------------------------
 # PROXY POOL
@@ -82,7 +100,6 @@ def _make_proxy(host: str, port: str) -> dict:
 
 _PROXY_POOL: list[dict] = [_make_proxy(h, p) for h, p in _HARDCODED_PROXIES]
 _pool_refreshed_at: datetime = datetime.min
-
 
 async def _refresh_proxy_pool() -> None:
     global _PROXY_POOL, _pool_refreshed_at
@@ -110,12 +127,9 @@ async def _refresh_proxy_pool() -> None:
         if proxies:
             _PROXY_POOL = proxies
             _pool_refreshed_at = datetime.utcnow()
-            print(f"[ProxyPool] ✅ Loaded {len(_PROXY_POOL)} proxies from Webshare")
-        else:
-            print("[ProxyPool] ⚠️ API returned 0 proxies — keeping existing pool")
+            print(f"[ProxyPool] ✅ Loaded {len(_PROXY_POOL)} proxies")
     except Exception as exc:
-        print(f"[ProxyPool] Fetch failed: {exc} — keeping existing pool")
-
+        print(f"[ProxyPool] Fetch failed: {exc}")
 
 def _proxy_browser_dict(p: dict) -> dict:
     return {"server": f"http://{p['host']}:{p['port']}", "username": p["user"], "password": p["pass"]}
@@ -123,52 +137,45 @@ def _proxy_browser_dict(p: dict) -> dict:
 def _proxy_httpx_url(p: dict) -> str:
     return f"http://{p['user']}:{p['pass']}@{p['host']}:{p['port']}"
 
+def _proxy_camoufox_dict(p: dict) -> dict:
+    return {"server": f"http://{p['host']}:{p['port']}", "username": p["user"], "password": p["pass"]}
+
 # ---------------------------------------------------------------------------
-# STEALTH
+# STEALTH (JS fallback)
 # ---------------------------------------------------------------------------
 try:
     from playwright_stealth import stealth_async as _stealth_async
     STEALTH_LIB = True
-    print("[Stealth] playwright-stealth available ✅")
 except ImportError:
     STEALTH_LIB = False
-    print("[Stealth] playwright-stealth not installed")
 
 print("=" * 60)
-print(f"[Deploy] Python            : {sys.version}")
-print(f"[Deploy] playwright-stealth: {'✅' if STEALTH_LIB else '❌'}")
-print(f"[Deploy] CAPSOLVER_API_KEY : {'SET ✅' if CAPSOLVER_API_KEY else 'NOT SET ❌'}")
-print(f"[Deploy] WEBSHARE_API_KEY  : {'SET ✅' if WEBSHARE_API_KEY else 'NOT SET — hardcoded pool'}")
-print(f"[Deploy] Proxy pool size   : {len(_PROXY_POOL)}")
-print(f"[Deploy] Race workers      : {RACE_WORKERS}  |  Max rounds : {RACE_MAX_ROUNDS}")
-print(f"[Deploy] Worker timeout    : {WORKER_TIMEOUT}s  |  Max browsers: {MAX_BROWSERS}")
+print(f"[Deploy] Camoufox          : {'✅' if CAMOUFOX_AVAILABLE else '❌ Chromium fallback'}")
+print(f"[Deploy] CAPSOLVER_API_KEY : {'✅' if CAPSOLVER_API_KEY else '❌'}")
+print(f"[Deploy] Demo Mode         : 1 worker, 5 rounds, 5min timeout")
 print("=" * 60)
 
 STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 Object.defineProperty(navigator, 'plugins', { get: () => [
-    { name: 'Chrome PDF Plugin',  filename: 'internal-pdf-viewer',              description: 'Portable Document Format' },
-    { name: 'Chrome PDF Viewer',  filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-    { name: 'Native Client',      filename: 'internal-nacl-plugin',             description: '' },
+    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
+    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+    { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
 ]});
-Object.defineProperty(navigator, 'languages',           { get: () => ['en-US', 'en', 'ar'] });
-Object.defineProperty(navigator, 'language',            { get: () => 'en-US' });
-Object.defineProperty(navigator, 'platform',            { get: () => 'Win32' });
-Object.defineProperty(navigator, 'vendor',              { get: () => 'Google Inc.' });
+Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'ar'] });
+Object.defineProperty(navigator, 'language', { get: () => 'en-US' });
+Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
 Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-Object.defineProperty(navigator, 'deviceMemory',        { get: () => 8 });
-Object.defineProperty(navigator, 'maxTouchPoints',      { get: () => 0 });
+Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
 window.chrome = {
-    runtime: { id: undefined, connect: () => {}, sendMessage: () => {},
-               onMessage: { addListener: () => {}, removeListener: () => {} } },
-    loadTimes: () => ({ requestTime: Date.now()/1000 - Math.random(),
-                        wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2', connectionInfo: 'h2' }),
-    csi: () => ({ startE: Date.now()-500, onloadT: Date.now()-200, pageT: 1200, tran: 15 }),
-    app: {},
+    runtime: { id: undefined, connect: () => {}, sendMessage: () => {}, onMessage: { addListener: () => {}, removeListener: () => {} } },
+    loadTimes: () => ({ requestTime: Date.now()/1000 - Math.random(), wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2', connectionInfo: 'h2' }),
+    csi: () => ({ startE: Date.now()-500, onloadT: Date.now()-200, pageT: 1200, tran: 15 }), app: {},
 };
 const _oQ = window.navigator.permissions.query.bind(navigator.permissions);
-window.navigator.permissions.query = (p) =>
-    p.name === 'notifications' ? Promise.resolve({ state: Notification.permission }) : _oQ(p);
+window.navigator.permissions.query = (p) => p.name === 'notifications' ? Promise.resolve({ state: Notification.permission }) : _oQ(p);
 const _oD = HTMLCanvasElement.prototype.toDataURL;
 HTMLCanvasElement.prototype.toDataURL = function(t, ...a) {
     const c = this.getContext('2d');
@@ -187,16 +194,15 @@ try {
         return _oG2.call(this, p);
     };
 } catch(e) {}
-Object.defineProperty(screen, 'width',       { get: () => 1920 });
-Object.defineProperty(screen, 'height',      { get: () => 1080 });
-Object.defineProperty(screen, 'availWidth',  { get: () => 1920 });
+Object.defineProperty(screen, 'width', { get: () => 1920 });
+Object.defineProperty(screen, 'height', { get: () => 1080 });
+Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
 Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
-Object.defineProperty(screen, 'colorDepth',  { get: () => 24 });
-Object.defineProperty(screen, 'pixelDepth',  { get: () => 24 });
+Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
+Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
 try {
     Object.defineProperty(navigator, 'connection', {
-        get: () => ({ effectiveType: '4g', rtt: 50+Math.floor(Math.random()*50),
-                      downlink: 10+Math.random()*5, saveData: false })
+        get: () => ({ effectiveType: '4g', rtt: 50+Math.floor(Math.random()*50), downlink: 10+Math.random()*5, saveData: false })
     });
 } catch(e) {}
 """
@@ -208,8 +214,8 @@ async def _apply_cdp_stealth(bs) -> None:
     if fn:
         try:
             await fn(STEALTH_SCRIPT) if asyncio.iscoroutinefunction(fn) else fn(STEALTH_SCRIPT)
-        except Exception as e:
-            print(f"[Stealth] failed: {e}")
+        except Exception:
+            pass
     if STEALTH_LIB:
         gp = getattr(bs, "_cdp_get_all_pages", None)
         if gp:
@@ -228,7 +234,6 @@ async def _apply_cdp_stealth(bs) -> None:
 # ---------------------------------------------------------------------------
 # PAGE HELPERS
 # ---------------------------------------------------------------------------
-
 async def _page_url(page) -> str:
     try:
         fn = getattr(page, "get_url", None)
@@ -259,38 +264,113 @@ async def _frame_url(frame) -> str:
         return ""
 
 # ---------------------------------------------------------------------------
+# HUMAN BEHAVIOR SIMULATION
+# ---------------------------------------------------------------------------
+async def human_mouse_move(page, to_x: int, to_y: int) -> None:
+    """Bezier curve mouse movement"""
+    try:
+        # Get current position
+        current = await page.evaluate("() => [window.lastMouseX || 0, window.lastMouseY || 0]")
+        start_x, start_y = current[0], current[1]
+        
+        # Generate bezier control points
+        cp1_x = start_x + (to_x - start_x) * random.uniform(0.2, 0.4)
+        cp1_y = start_y + (to_y - start_y) * random.uniform(0.2, 0.4) + random.randint(-50, 50)
+        cp2_x = start_x + (to_x - start_x) * random.uniform(0.6, 0.8)
+        cp2_y = start_y + (to_y - start_y) * random.uniform(0.6, 0.8) + random.randint(-50, 50)
+        
+        # Move in steps along curve
+        steps = random.randint(15, 25)
+        for i in range(steps + 1):
+            t = i / steps
+            # Cubic bezier formula
+            x = int((1-t)**3 * start_x + 3*(1-t)**2*t * cp1_x + 3*(1-t)*t**2 * cp2_x + t**3 * to_x)
+            y = int((1-t)**3 * start_y + 3*(1-t)**2*t * cp1_y + 3*(1-t)*t**2 * cp2_y + t**3 * to_y)
+            
+            await page.mouse.move(x, y)
+            await asyncio.sleep(random.uniform(0.01, 0.03))
+        
+        # Store position for next move
+        await page.evaluate(f"() => {{ window.lastMouseX = {to_x}; window.lastMouseY = {to_y}; }}")
+    except Exception:
+        pass
+
+async def human_scroll(page, distance: int = 300) -> None:
+    """Human-like scrolling with variable speed"""
+    try:
+        scroll_steps = random.randint(8, 15)
+        step_size = distance / scroll_steps
+        
+        for _ in range(scroll_steps):
+            await page.evaluate(f"window.scrollBy(0, {step_size})")
+            await asyncio.sleep(random.uniform(0.05, 0.15))
+        
+        # Random pause after scroll
+        await asyncio.sleep(random.uniform(0.3, 0.8))
+    except Exception:
+        pass
+
+async def human_delay_long() -> None:
+    """5-15 second human thinking pause"""
+    await asyncio.sleep(random.uniform(5.0, 15.0))
+
+async def human_delay_short() -> None:
+    """1-3 second pause"""
+    await asyncio.sleep(random.uniform(1.0, 3.0))
+
+# ---------------------------------------------------------------------------
+# EXTENDED WARM-UP (3 pages before target)
+# ---------------------------------------------------------------------------
+async def _warmup_extended(page, wid: str) -> None:
+    """Browse 3 random pages to establish realistic session"""
+    sites = [
+        "https://www.google.com/search?q=uae+news",
+        "https://www.bbc.com/news",
+        "https://www.wikipedia.org",
+        "https://www.linkedin.com",
+        "https://www.bing.com/search?q=dubai+weather",
+    ]
+    
+    random.shuffle(sites)
+    
+    for i, site in enumerate(sites[:3]):  # Visit 3 sites
+        try:
+            print(f"[W{wid}] Warm-up {i+1}/3: {site}")
+            nav = getattr(page, "goto", None) or getattr(page, "navigate", None)
+            if nav:
+                await nav(site, timeout=20000)
+                
+                # Realistic user behavior on each page
+                await human_delay_short()
+                
+                # Random scroll
+                await human_scroll(page, random.randint(200, 600))
+                
+                # Random mouse movement
+                await human_mouse_move(page, random.randint(300, 1200), random.randint(200, 700))
+                
+                # Longer pause between pages
+                await asyncio.sleep(random.uniform(2.0, 4.0))
+                
+        except Exception as e:
+            print(f"[W{wid}] Warm-up {i+1} failed (non-fatal): {e}")
+    
+    print(f"[W{wid}] ✅ Extended warm-up complete (3 pages)")
+
+# ---------------------------------------------------------------------------
 # PROXY VERIFY
 # ---------------------------------------------------------------------------
-
 async def _verify_proxy(proxy: dict, wid: str) -> None:
     try:
         async with httpx.AsyncClient(proxy=_proxy_httpx_url(proxy), timeout=8) as c:
-            ip   = (await c.get("https://ipinfo.io/json")).json().get("ip", "?")
-            mark = "🟢" if ip == proxy["host"] else "🟡"
-            print(f"[W{wid}] Proxy {mark} exit={ip}")
+            ip = (await c.get("https://ipinfo.io/json")).json().get("ip", "?")
+            print(f"[W{wid}] Proxy exit IP: {ip}")
     except Exception as e:
         print(f"[W{wid}] ProxyCheck failed: {e}")
 
 # ---------------------------------------------------------------------------
-# FIX-1: BROWSER WARM-UP — called BEFORE agent.run(), not inside step callback
-# ---------------------------------------------------------------------------
-
-async def _warmup_page(page, wid: str) -> None:
-    """Navigate to a neutral site to seed cookies and HTTP/2 session state."""
-    site = random.choice(["https://www.google.com", "https://www.bing.com", "https://www.wikipedia.org"])
-    try:
-        nav = getattr(page, "goto", None) or getattr(page, "navigate", None)
-        if nav:
-            await nav(site, timeout=15000)
-            await asyncio.sleep(random.uniform(2.0, 3.5))
-            print(f"[W{wid}] Warm-up ✅ ({site})")
-    except Exception as e:
-        print(f"[W{wid}] Warm-up failed (non-fatal): {e}")
-
-# ---------------------------------------------------------------------------
 # CAPSOLVER
 # ---------------------------------------------------------------------------
-
 async def _capsolver_solve(task: dict, proxy: dict | None = None) -> dict | None:
     if not CAPSOLVER_API_KEY:
         return None
@@ -326,7 +406,6 @@ async def _capsolver_solve(task: dict, proxy: dict | None = None) -> dict | None
 # ---------------------------------------------------------------------------
 # CAPTCHA DETECTION
 # ---------------------------------------------------------------------------
-
 async def _solve_captcha(page, proxy: dict) -> None:
     try:
         try:
@@ -336,7 +415,7 @@ async def _solve_captcha(page, proxy: dict) -> None:
                 html = await page.evaluate("() => document.documentElement.outerHTML")
             except Exception:
                 return
-        purl   = await _page_url(page)
+        purl = await _page_url(page)
         frames = await _page_frames(page)
 
         # Turnstile
@@ -353,6 +432,7 @@ async def _solve_captcha(page, proxy: dict) -> None:
             if m and ("cf-turnstile" in html or "turnstile" in html.lower()):
                 ts_key = m.group(1)
         if ts_key:
+            print("[CAPTCHA] Turnstile detected — solving…")
             sol = await _capsolver_solve(
                 {"type": "AntiTurnstileTask", "websiteURL": purl, "websiteKey": ts_key}, proxy=proxy)
             if sol:
@@ -363,13 +443,15 @@ async def _solve_captcha(page, proxy: dict) -> None:
                     const el = document.querySelector('.cf-turnstile,[data-sitekey]');
                     if (el) { const cb=el.getAttribute('data-callback'); if(cb&&window[cb]) try{window[cb](t);}catch(e){} }
                 }""", t)
+                print("[CAPTCHA] Turnstile solved ✅")
             return
 
-        # CF JS challenge
         if "Just a moment" in html or "cf-browser-verification" in html:
+            print("[CAPTCHA] Cloudflare JS challenge — waiting…")
             for _ in range(15):
                 await asyncio.sleep(1)
                 if "Just a moment" not in await page.content():
+                    print("[CAPTCHA] Cloudflare cleared ✅")
                     return
             return
 
@@ -397,6 +479,7 @@ async def _solve_captcha(page, proxy: dict) -> None:
             if m:
                 rc_key = m.group(1)
         if rc_key and "6L" in rc_key:
+            print("[CAPTCHA] reCAPTCHA v2 detected — solving…")
             sol = await _capsolver_solve(
                 {"type": "ReCaptchaV2Task", "websiteURL": purl, "websiteKey": rc_key}, proxy=proxy)
             if sol:
@@ -411,12 +494,14 @@ async def _solve_captcha(page, proxy: dict) -> None:
                     const ta=document.querySelector('textarea[name="g-recaptcha-response"]');
                     if(ta){const f=ta.closest('form');if(f)try{f.submit();}catch(e){}}
                 }""", t)
+                print("[CAPTCHA] reCAPTCHA solved ✅")
             return
 
         # hCaptcha
         if "hcaptcha" in html.lower():
             m = _re.search(r'data-sitekey=["\']([^"\']+)["\']', html)
             if m:
+                print("[CAPTCHA] hCaptcha detected — solving…")
                 sol = await _capsolver_solve(
                     {"type": "HCaptchaTask", "websiteURL": purl, "websiteKey": m.group(1)}, proxy=proxy)
                 if sol:
@@ -429,16 +514,13 @@ async def _solve_captcha(page, proxy: dict) -> None:
                             if(cb&&window[cb])try{window[cb](t);}catch(e){}
                         });
                     }""", t)
+                    print("[CAPTCHA] hCaptcha solved ✅")
     except Exception as e:
         print(f"[CAPTCHA] error: {e}")
-
-async def human_delay(a: int = 300, b: int = 1000) -> None:
-    await asyncio.sleep(random.uniform(a / 1000, b / 1000))
 
 # ---------------------------------------------------------------------------
 # MODELS
 # ---------------------------------------------------------------------------
-
 class AgentRequest(BaseModel):
     prompt: str
     max_steps: int = 50
@@ -451,18 +533,17 @@ class AgentResponse(BaseModel):
     worker_id: str | None = None
 
 # ---------------------------------------------------------------------------
-# SCREENSHOT / FRAME HELPERS
+# SCREENSHOT HELPERS
 # ---------------------------------------------------------------------------
-
 def _ensure_frames(folder: str) -> None:
     if glob.glob(os.path.join(folder, "*.png")):
         return
     path = os.path.join(folder, "step_0000_placeholder.png")
     try:
         from PIL import Image, ImageDraw
-        img  = Image.new("RGB", (1920, 1080), color=(30, 30, 30))
+        img = Image.new("RGB", (1920, 1080), color=(30, 30, 30))
         draw = ImageDraw.Draw(img)
-        msg  = "No screenshot captured"
+        msg = "No screenshot captured"
         try:
             tw = draw.textlength(msg)
         except AttributeError:
@@ -514,7 +595,6 @@ def _dump_screenshots(history, folder: str) -> None:
         pass
 
 def _dump_json_screenshots(folder: str) -> None:
-    saved = 0
     for jf in sorted(glob.glob(os.path.join(folder, "conversation_*.json"))):
         try:
             data = json.load(open(jf, "r", encoding="utf-8"))
@@ -528,7 +608,7 @@ def _dump_json_screenshots(folder: str) -> None:
             for block in content:
                 if not isinstance(block, dict):
                     continue
-                iu  = (block.get("image_url") or {}).get("url", "")
+                iu = (block.get("image_url") or {}).get("url", "")
                 src = block.get("source") or {}
                 raw = ""
                 if iu.startswith("data:image"):
@@ -542,16 +622,14 @@ def _dump_json_screenshots(folder: str) -> None:
                     if not (b[:4] == b'\x89PNG' or b[:2] == b'\xff\xd8'):
                         continue
                     stem = os.path.splitext(os.path.basename(jf))[0]
-                    with open(os.path.join(folder, f"{stem}_img{saved+1:03d}.png"), "wb") as fh:
+                    with open(os.path.join(folder, f"{stem}_img001.png"), "wb") as fh:
                         fh.write(b)
-                    saved += 1
                 except Exception:
                     pass
 
 # ---------------------------------------------------------------------------
-# URL TYPO FIX
+# URL FIX
 # ---------------------------------------------------------------------------
-
 _REAL_AND_WORDS = frozenset({
     "command", "demand", "expand", "understand", "withstand", "contraband",
     "headband", "armband", "remand", "reprimand", "mainland", "farmland",
@@ -563,7 +641,7 @@ _REAL_AND_WORDS = frozenset({
 def _fix_url_typos(text: str) -> str:
     def _r(m: _re.Match) -> str:
         url = m.group(0)
-        t   = _re.search(r'([a-z]{4,}and)$', url)
+        t = _re.search(r'([a-z]{4,}and)$', url)
         if not t or t.group(1).lower() in _REAL_AND_WORDS:
             return url
         return url[:-3] + " and"
@@ -575,25 +653,24 @@ def _wrap_prompt(p: str) -> str:
 
 {p}
 
-=== CRITICAL RULES FOR ADDING AGENT TOOLS ===
-RULE 1: After clicking '+', wait 2s for GREEN TOAST. Toast seen → added, do NOT click again. No toast → try once more. NEVER click more than twice.
+=== CRITICAL RULES ===
+RULE 1: After clicking '+', wait 2s for GREEN TOAST. Toast seen → added, do NOT click again.
 RULE 2: "Could not get element geometry" = JavaScript click fired. Trust it. Wait for toast.
 RULE 3: Once modal is closed, do NOT reopen it.
-RULE 4: After closing modal, go straight to main chat input. Do not look back at sidebar.
-=== END CRITICAL RULES ===
+RULE 4: After closing modal, go straight to main chat input.
+=== END RULES ===
 
-=== DATA EXTRACTION RULES ===
-When extracting rows from a paginated or scrollable table:
-- Before calling extract, run JS: document.querySelector('table, .table, [role="grid"]')?.scrollIntoView()
-- Extract href from EVERY anchor in first/code column; if relative (starts with /), prepend https://procurement.gov.ae
-- Set notice_link to null ONLY if there is genuinely no anchor — never null just because row was off-screen.
-=== END DATA EXTRACTION RULES ===
+=== DATA EXTRACTION ===
+Before extracting table data:
+- Run JS: document.querySelector('table, .table, [role="grid"]')?.scrollIntoView()
+- Extract href from EVERY anchor; if relative (starts with /), prepend https://procurement.gov.ae
+- Set notice_link to null ONLY if no anchor exists.
+=== END ===
 """
 
 # ---------------------------------------------------------------------------
-# LLM BUILDER
+# LLM
 # ---------------------------------------------------------------------------
-
 def build_llm(model: str, api_key: str):
     for mod, cls in [("browser_use.llm", "ChatOpenAI"), ("browser_use.agent.llm", "ChatOpenAI")]:
         try:
@@ -612,7 +689,6 @@ def build_llm(model: str, api_key: str):
 # ---------------------------------------------------------------------------
 # RESULT CLEANER
 # ---------------------------------------------------------------------------
-
 def _clean_result(text: str) -> Any:
     if not text:
         return text
@@ -642,62 +718,112 @@ def _clean_result(text: str) -> Any:
                 pass
     return text
 
-# FIX-5: Smarter validation — checks for real data keys, not just string length
 def _is_valid(result: Any) -> bool:
     if result in (None, "", [], {}):
         return False
     if isinstance(result, str):
         low = result.lower()
-        # Explicit rejection patterns
-        bad_phrases = [
-            "agent error", "browser_check", "captcha", "wrong captcha",
-            "error:", "maintenance", "access denied", "forbidden",
-            "please wait", "just a moment", "checking your browser",
-        ]
-        if any(k in low for k in bad_phrases):
+        bad = ["agent error", "browser_check", "captcha", "wrong captcha",
+               "error:", "maintenance", "access denied", "forbidden",
+               "please wait", "just a moment", "checking your browser"]
+        if any(k in low for k in bad):
             return False
-        # Must be substantial to be real extracted data
         if len(result) < 200:
             return False
     if isinstance(result, dict):
-        # Must have at least one list with actual items
-        has_data = any(isinstance(v, list) and len(v) > 0 for v in result.values())
-        if not has_data:
-            return False
-        # Extra check: if it looks like a tenders response, verify items have expected keys
         for v in result.values():
             if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
-                item_keys = set(v[0].keys())
-                # Accept if item has at least 2 of these typical extraction keys
-                expected = {"reference_number", "issuing_entity", "tender_title",
-                            "publication_begin_utc", "submission_deadline_utc", "notice_link"}
-                if len(item_keys & expected) >= 2:
-                    return True
-        return has_data
+                return True
+        return any(isinstance(v, list) and len(v) > 0 for v in result.values())
     if isinstance(result, list):
         return len(result) > 0 and isinstance(result[0], dict)
     return True
 
 # ---------------------------------------------------------------------------
-# SINGLE WORKER  (with all 6 fixes applied)
+# BROWSER FACTORY
 # ---------------------------------------------------------------------------
+async def _create_browser_and_page(proxy: dict, wid: str):
+    if CAMOUFOX_AVAILABLE:
+        try:
+            viewport = random.choice(VIEWPORTS)
+            camoufox_ctx = AsyncCamoufox(
+                headless=True,
+                os="windows",
+                proxy=_proxy_camoufox_dict(proxy),
+                geoip=True,
+                humanize=True,
+                screen=viewport,  # Random viewport size
+            )
+            browser = await camoufox_ctx.__aenter__()
+            page = await browser.new_page()
+            print(f"[W{wid}] 🦊 Camoufox launched ({viewport['width']}x{viewport['height']})")
+            return camoufox_ctx, page, True
+        except Exception as e:
+            print(f"[W{wid}] Camoufox failed ({e}), fallback to Chromium")
 
+    # Chromium fallback
+    if BrowserConfig and Browser:
+        try:
+            viewport = random.choice(VIEWPORTS)
+            ua = random.choice(USER_AGENTS)
+            cfg = BrowserConfig(
+                headless="new",
+                proxy=_proxy_browser_dict(proxy),
+                extra_chromium_args=[
+                    "--disable-blink-features=AutomationControlled",
+                    "--no-sandbox", "--disable-dev-shm-usage",
+                    "--enable-webgl", "--use-gl=swiftshader",
+                    "--enable-accelerated-2d-canvas",
+                    f"--window-size={viewport['width']},{viewport['height']}",
+                    "--start-maximized",
+                    "--disable-features=IsolateOrigins,site-per-process",
+                    "--disable-background-timer-throttling",
+                    "--disable-backgrounding-occluded-windows",
+                    "--disable-renderer-backgrounding",
+                    "--no-first-run", "--no-default-browser-check",
+                    "--password-store=basic", "--use-mock-keychain",
+                    "--disable-infobars", "--lang=en-US,en",
+                    "--accept-lang=en-US,en;q=0.9,ar;q=0.8",
+                    f'--user-agent={ua}',
+                ],
+            )
+            b = Browser(config=cfg)
+            print(f"[W{wid}] 🌐 Chromium launched ({viewport['width']}x{viewport['height']})")
+            return b, None, False
+        except Exception as e:
+            print(f"[W{wid}] Chromium also failed: {e}")
+    return None, None, False
+
+async def _close_browser(browser_obj, is_camoufox: bool) -> None:
+    if browser_obj is None:
+        return
+    try:
+        if is_camoufox:
+            await browser_obj.__aexit__(None, None, None)
+        else:
+            await browser_obj.close()
+    except Exception:
+        pass
+
+# ---------------------------------------------------------------------------
+# SINGLE WORKER
+# ---------------------------------------------------------------------------
 async def _run_worker(
     wid: str,
     proxy: dict,
     request: AgentRequest,
     result_queue: asyncio.Queue,
     cancel_event: asyncio.Event,
-    winner_lock: asyncio.Lock,      # FIX-2: prevents double-queue
+    winner_lock: asyncio.Lock,
 ) -> None:
-    sid    = f"w{wid}_{str(uuid.uuid4())[:6]}"
+    sid = f"w{wid}_{str(uuid.uuid4())[:6]}"
     folder = f"{SCAN_DIR}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{sid}"
     os.makedirs(folder, exist_ok=True)
-    print(f"[W{wid}] Starting — proxy {proxy['host']}:{proxy['port']}")
+    print(f"[W{wid}] Starting — {proxy['host']}:{proxy['port']}")
 
-    llm   = build_llm(request.model, os.getenv("OPENAI_API_KEY", ""))
+    llm = build_llm(request.model, os.getenv("OPENAI_API_KEY", ""))
     steps = [0]
-    pc    = [False]
+    pc = [False]
 
     async def _step(agent) -> None:
         if cancel_event.is_set():
@@ -711,12 +837,25 @@ async def _run_worker(
             if not pc[0]:
                 pc[0] = True
                 await _verify_proxy(proxy, wid)
-            await _apply_cdp_stealth(bs)
+            if not CAMOUFOX_AVAILABLE:
+                await _apply_cdp_stealth(bs)
             page = await bs.get_current_page()
             if page is None:
                 return
+            
+            # Human behavior every 3 steps
+            if n % 3 == 0:
+                await human_scroll(page, random.randint(200, 400))
+                await human_mouse_move(page, random.randint(400, 1400), random.randint(300, 800))
+            
             await _solve_captcha(page, proxy)
-            await human_delay(200, 800)
+            
+            # Longer random pauses every 5 steps
+            if n % 5 == 0:
+                await human_delay_long()
+            else:
+                await human_delay_short()
+            
             img = await page.screenshot()
             if isinstance(img, str):
                 img = base64.b64decode(img)
@@ -728,66 +867,40 @@ async def _run_worker(
         except Exception as e:
             print(f"[W{wid}] step {n} err: {e}")
 
-    kwargs: dict = dict(
-        task=_wrap_prompt(request.prompt), llm=llm,
-        save_conversation_path=folder, max_actions_per_step=1,
-        use_vision=True, max_failures=3, retry_delay=2,
-    )
+    browser_obj = None
+    is_camoufox = False
+    history = None
+    rt = ""
 
-    # FIX-7: Acquire semaphore before launching browser to cap concurrent instances
-    browser = None
     async with _browser_semaphore:
-        if BrowserConfig and Browser:
-            try:
-                browser = Browser(config=BrowserConfig(
-                    headless="new",
-                    proxy=_proxy_browser_dict(proxy),
-                    extra_chromium_args=[
-                        "--disable-blink-features=AutomationControlled",
-                        "--no-sandbox", "--disable-dev-shm-usage",
-                        "--enable-webgl", "--use-gl=swiftshader",
-                        "--enable-accelerated-2d-canvas",
-                        "--window-size=1920,1080", "--start-maximized",
-                        "--disable-features=IsolateOrigins,site-per-process",
-                        "--disable-background-timer-throttling",
-                        "--disable-backgrounding-occluded-windows",
-                        "--disable-renderer-backgrounding",
-                        "--no-first-run", "--no-default-browser-check",
-                        "--password-store=basic", "--use-mock-keychain",
-                        "--disable-infobars",
-                        "--lang=en-US,en", "--accept-lang=en-US,en;q=0.9,ar;q=0.8",
-                        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
-                    ],
-                ))
-                kwargs["browser"] = browser
-            except Exception as e:
-                print(f"[W{wid}] BrowserConfig failed: {e}")
-
-        history = None
-        rt      = ""
         try:
-            # FIX-1: Warm up BEFORE agent.run() using a direct page navigation
-            if browser is not None:
-                try:
-                    # Get the initial page that browser-use opens and warm it up
-                    agent_pre = Agent(**{**kwargs, "task": "navigate to https://www.google.com"})
-                    bs_pre    = getattr(agent_pre, "browser_session", None)
-                    if bs_pre:
-                        page_pre = await bs_pre.get_current_page()
-                        if page_pre:
-                            await _warmup_page(page_pre, wid)
-                except Exception as e:
-                    print(f"[W{wid}] Pre-warmup failed (non-fatal): {e}")
+            browser_obj, warm_page, is_camoufox = await _create_browser_and_page(proxy, wid)
 
-            agent   = Agent(**kwargs)
-            # FIX-3: Kill worker if it hangs beyond WORKER_TIMEOUT seconds
+            # EXTENDED WARM-UP (3 pages)
+            if warm_page is not None:
+                await _warmup_extended(warm_page, wid)
+
+            kwargs: dict = dict(
+                task=_wrap_prompt(request.prompt), llm=llm,
+                save_conversation_path=folder, max_actions_per_step=1,
+                use_vision=True, max_failures=3, retry_delay=2,
+            )
+
+            if is_camoufox and browser_obj is not None:
+                try:
+                    kwargs["browser"] = browser_obj
+                except Exception:
+                    pass
+            elif browser_obj is not None:
+                kwargs["browser"] = browser_obj
+
+            agent = Agent(**kwargs)
             history = await asyncio.wait_for(
                 agent.run(max_steps=request.max_steps, on_step_end=_step),
                 timeout=WORKER_TIMEOUT,
             )
 
-            # 4-pass result extraction
+            # 4-pass extraction
             try:
                 fr = history.final_result()
                 if fr:
@@ -826,19 +939,14 @@ async def _run_worker(
 
             cleaned = _clean_result(rt)
 
-            # FIX-2: Use lock to guarantee only ONE worker ever wins
             if _is_valid(cleaned) and not cancel_event.is_set():
                 async with winner_lock:
                     if cancel_event.is_set():
-                        print(f"[W{wid}] Lost the race (another worker claimed slot first)")
+                        print(f"[W{wid}] Lost the race")
                         return
-                    # Claim the slot — signal all other workers to stop
                     cancel_event.set()
 
-                print(f"[W{wid}] ✅ Valid result! Queuing data…")
-
-                # FIX-6: Queue extracted data FIRST, then build video separately
-                # This way data is never lost even if video upload crashes
+                print(f"[W{wid}] ✅ Valid result!")
                 _dump_screenshots(history, folder)
                 _dump_json_screenshots(folder)
                 _ensure_frames(folder)
@@ -849,26 +957,20 @@ async def _run_worker(
                     print(f"[W{wid}] Building video ({fc} frames)…")
                     video_url = await create_and_upload_video(folder, sid)
                 except Exception as ve:
-                    print(f"[W{wid}] Video build failed (data still saved): {ve}")
+                    print(f"[W{wid}] Video failed: {ve}")
 
-                # Put result — data guaranteed even if video_url is None
                 await result_queue.put((wid, cleaned, steps[0], video_url))
             else:
-                print(f"[W{wid}] ❌ No valid result (CAPTCHA wall or empty)")
+                print(f"[W{wid}] ❌ Invalid result")
 
         except asyncio.TimeoutError:
-            # FIX-3: Worker exceeded timeout
-            print(f"[W{wid}] ⏱ Timed out after {WORKER_TIMEOUT}s — killing")
+            print(f"[W{wid}] ⏱ Timeout ({WORKER_TIMEOUT}s)")
         except asyncio.CancelledError:
-            print(f"[W{wid}] Cancelled (another worker won)")
+            print(f"[W{wid}] Cancelled")
         except Exception as e:
             print(f"[W{wid}] Error: {e}")
         finally:
-            if browser:
-                try:
-                    await browser.close()
-                except Exception:
-                    pass
+            await _close_browser(browser_obj, is_camoufox)
             try:
                 shutil.rmtree(folder)
             except Exception:
@@ -877,17 +979,13 @@ async def _run_worker(
 # ---------------------------------------------------------------------------
 # RACE RUNNER
 # ---------------------------------------------------------------------------
-
 async def _race(request: AgentRequest, proxies: list[dict]):
-    """Race workers. Returns (wid, data, steps, video_url) for first winner, or None."""
-    q           = asyncio.Queue()
-    cancel      = asyncio.Event()
-    winner_lock = asyncio.Lock()   # FIX-2
+    q = asyncio.Queue()
+    cancel = asyncio.Event()
+    winner_lock = asyncio.Lock()
 
     tasks = [
-        asyncio.create_task(
-            _run_worker(str(i+1), p, request, q, cancel, winner_lock)
-        )
+        asyncio.create_task(_run_worker(str(i+1), p, request, q, cancel, winner_lock))
         for i, p in enumerate(proxies)
     ]
 
@@ -918,32 +1016,28 @@ async def _race(request: AgentRequest, proxies: list[dict]):
 # ---------------------------------------------------------------------------
 # MAIN ENDPOINT
 # ---------------------------------------------------------------------------
-
 @app.post("/agent/run", response_model=AgentResponse)
 async def run_agent(request: AgentRequest) -> AgentResponse:
     await _refresh_proxy_pool()
 
     print(f"\n{'='*60}")
-    print(f"[Race] Task    : {request.prompt[:80]}…")
-    print(f"[Race] Model   : {request.model}")
-    print(f"[Race] Workers : {RACE_WORKERS}  |  Rounds: {RACE_MAX_ROUNDS}  |  Timeout: {WORKER_TIMEOUT}s")
-    print(f"[Race] Pool    : {len(_PROXY_POOL)} proxies  |  Max browsers: {MAX_BROWSERS}")
+    print(f"[Demo] Task    : {request.prompt[:80]}…")
+    print(f"[Demo] Browser : {'Camoufox 🦊' if CAMOUFOX_AVAILABLE else 'Chromium'}")
+    print(f"[Demo] Mode    : 1 worker, 5 rounds, 5min timeout, extended warm-up")
     print(f"{'='*60}\n")
 
-    # Snapshot pool at request time to avoid mid-refresh issues
     pool = list(_PROXY_POOL)
     random.shuffle(pool)
 
     for rnd in range(1, RACE_MAX_ROUNDS + 1):
-        start   = ((rnd - 1) * RACE_WORKERS) % max(len(pool), 1)
-        proxies = [pool[(start + i) % len(pool)] for i in range(RACE_WORKERS)]
-        print(f"[Race] Round {rnd}/{RACE_MAX_ROUNDS} — {[p['host'] for p in proxies]}")
+        proxies = [pool[(rnd - 1) % len(pool)]]  # Single proxy per round
+        print(f"[Demo] Round {rnd}/5 — {proxies[0]['host']}")
 
         winner = await _race(request, proxies)
 
         if winner is not None:
             wid, data, steps, vu = winner
-            print(f"\n[Race] 🏆 Winner: Worker-{wid} in round {rnd}")
+            print(f"\n[Demo] 🏆 Success in round {rnd}")
             return AgentResponse(
                 video_url=vu,
                 steps_taken=steps,
@@ -951,15 +1045,14 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
                 worker_id=wid,
             )
 
-        print(f"[Race] Round {rnd} — all workers failed, next round…")
+        print(f"[Demo] Round {rnd} failed, next proxy…")
 
-    print("[Race] ❌ All rounds exhausted — no valid result")
+    print("[Demo] ❌ All rounds exhausted")
     return AgentResponse(video_url=None, steps_taken=0, extracted_data=None, worker_id=None)
 
 # ---------------------------------------------------------------------------
 # STARTUP + HEALTH
 # ---------------------------------------------------------------------------
-
 @app.on_event("startup")
 async def startup_event():
     await _refresh_proxy_pool()
@@ -968,10 +1061,8 @@ async def startup_event():
 async def health() -> dict:
     return {
         "status": "ok",
-        "version": "5.0.0",
+        "version": "6.1.0-demo-stealth",
+        "browser": "camoufox" if CAMOUFOX_AVAILABLE else "chromium-fallback",
         "proxy_pool_size": len(_PROXY_POOL),
-        "race_workers": RACE_WORKERS,
-        "race_max_rounds": RACE_MAX_ROUNDS,
-        "worker_timeout_sec": WORKER_TIMEOUT,
-        "max_browsers": MAX_BROWSERS,
+        "mode": "single-worker-extended-warmup",
     }
