@@ -1,12 +1,12 @@
 """
-main.py  v6.2 — FIXED FOR DEMO
+main.py  v6.3 — CAMOUFOX COMPATIBILITY FIX
 ----------------------------------
-CHANGES FROM v6.1:
-  ✅ Bright Data residential proxy (single rotating endpoint)
-  ✅ Removed STEALTH_SCRIPT (conflicts with Camoufox, causes detection)
-  ✅ Re-enabled extended warm-up
-  ✅ Fixed human_scroll (non-uniform acceleration curve)
-  ✅ Credentials moved to .env only
+CHANGES FROM v6.2:
+  ✅ Fixed Camoufox crash: 'dict' object has no attribute 'is_set'
+     → browser-use 0.11.13 expects a Playwright browser object, not AsyncCamoufox context
+     → Now correctly extracts the underlying playwright browser from Camoufox
+  ✅ Warm-up now uses the Camoufox page directly before handing off to agent
+  ✅ SSL verify disabled for proxy health check (Bright Data uses self-signed cert)
 """
 from __future__ import annotations
 from typing import Any
@@ -40,16 +40,18 @@ from utils.helpers import create_and_upload_video
 
 load_dotenv()
 
-app = FastAPI(title="OnDemand Browser-Use Agent", version="6.2.0")
+app = FastAPI(title="OnDemand Browser-Use Agent", version="6.3.0")
 SCAN_DIR = "scans"
 os.makedirs(SCAN_DIR, exist_ok=True)
 
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
 WEBSHARE_API_KEY  = os.getenv("WEBSHARE_API_KEY", "")
 
-# Bright Data residential proxy — set these in your .env
-PROXY_USER = os.getenv("PROXY_USER", "brd-customer-hl_ea313532-zone-demo")
-PROXY_PASS = os.getenv("PROXY_PASS", "jzbld1hf9ygu")
+# Bright Data credentials — set these in your .env
+PROXY_USER        = os.getenv("PROXY_USER", "brd-customer-hl_ea313532-zone-demo")
+PROXY_PASS        = os.getenv("PROXY_PASS", "jzbld1hf9ygu")
+BD_API_KEY        = os.getenv("BD_API_KEY", "25e73165-8000-4476-b814-6c79af3550c8")
+BD_UNLOCKER_ZONE  = os.getenv("BD_UNLOCKER_ZONE", "unlocker")
 
 # Single worker, multiple rounds
 RACE_WORKERS      = 1
@@ -229,11 +231,55 @@ async def _warmup_extended(page, wid: str) -> None:
 # ---------------------------------------------------------------------------
 async def _verify_proxy(proxy: dict, wid: str) -> None:
     try:
-        async with httpx.AsyncClient(proxy=_proxy_httpx_url(proxy), timeout=8) as c:
+        async with httpx.AsyncClient(proxy=_proxy_httpx_url(proxy), timeout=8, verify=False) as c:
             ip = (await c.get("https://ipinfo.io/json")).json().get("ip", "?")
             print(f"[W{wid}] Proxy exit IP: {ip}")
     except Exception as e:
         print(f"[W{wid}] ProxyCheck failed: {e}")
+
+# ---------------------------------------------------------------------------
+# BRIGHT DATA WEB UNLOCKER — fallback for heavily protected sites
+# ---------------------------------------------------------------------------
+async def _fetch_via_unlocker(url: str) -> str | None:
+    """Fetch a URL via Bright Data Web Unlocker API — bypasses any bot protection."""
+    if not BD_API_KEY:
+        return None
+    try:
+        print(f"[Unlocker] Fetching: {url}")
+        async with httpx.AsyncClient(timeout=60, verify=False) as c:
+            r = await c.post(
+                "https://api.brightdata.com/request",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {BD_API_KEY}",
+                },
+                json={"zone": BD_UNLOCKER_ZONE, "url": url, "format": "raw"},
+            )
+            if r.status_code == 200:
+                print(f"[Unlocker] ✅ Got {len(r.text)} chars")
+                return r.text
+            else:
+                print(f"[Unlocker] ❌ Status {r.status_code}: {r.text[:200]}")
+                return None
+    except Exception as e:
+        print(f"[Unlocker] Error: {e}")
+        return None
+
+async def _is_blocked(page) -> bool:
+    """Check if current page is blocked/captcha'd."""
+    try:
+        url = await _page_url(page)
+        if "browser_check" in url or "captcha" in url.lower():
+            return True
+        html = await page.content()
+        blocked_signals = [
+            "Just a moment", "cf-browser-verification", "browser_check",
+            "wrong captcha", "Access Denied", "403 Forbidden",
+            "Please verify you are a human",
+        ]
+        return any(s in html for s in blocked_signals)
+    except Exception:
+        return False
 
 # ---------------------------------------------------------------------------
 # CAPSOLVER
@@ -628,6 +674,8 @@ async def _create_browser_and_page(proxy: dict, wid: str):
                 "username": proxy['user'],
                 "password": proxy['pass'],
             }
+            # Launch Camoufox and get the underlying playwright browser
+            # browser-use 0.11.13 needs a raw playwright Browser object, not AsyncCamoufox context
             camoufox_ctx = AsyncCamoufox(
                 headless=True,
                 os="windows",
@@ -636,10 +684,15 @@ async def _create_browser_and_page(proxy: dict, wid: str):
                 humanize=0.5,
                 screen={"width": viewport['width'], "height": viewport['height']},
             )
-            browser = await camoufox_ctx.__aenter__()
-            page = await browser.new_page()
+            # __aenter__ returns the playwright browser directly
+            playwright_browser = await camoufox_ctx.__aenter__()
+            
+            # Open a warm-up page
+            warm_page = await playwright_browser.new_page()
+            
             print(f"[W{wid}] 🦊 Camoufox launched ({viewport['width']}x{viewport['height']})")
-            return camoufox_ctx, page, True
+            # Return ctx for cleanup, warm_page for warm-up, and the raw browser for agent
+            return camoufox_ctx, warm_page, playwright_browser
         except Exception as e:
             print(f"[W{wid}] Camoufox failed ({e}), fallback to Chromium")
 
@@ -671,10 +724,10 @@ async def _create_browser_and_page(proxy: dict, wid: str):
             )
             b = Browser(config=cfg)
             print(f"[W{wid}] 🌐 Chromium launched ({viewport['width']}x{viewport['height']})")
-            return b, None, False
+            return b, None, None  # no warm_page, no raw browser for Chromium path
         except Exception as e:
             print(f"[W{wid}] Chromium also failed: {e}")
-    return None, None, False
+    return None, None, None
 
 async def _close_browser(browser_obj, is_camoufox: bool) -> None:
     if browser_obj is None:
@@ -683,7 +736,10 @@ async def _close_browser(browser_obj, is_camoufox: bool) -> None:
         if is_camoufox:
             await browser_obj.__aexit__(None, None, None)
         else:
-            await browser_obj.close()
+            try:
+                await browser_obj.close()
+            except Exception:
+                pass
     except Exception:
         pass
 
@@ -730,6 +786,21 @@ async def _run_worker(
 
             await _solve_captcha(page, proxy)
 
+            # Web Unlocker fallback — if still blocked after captcha solve attempt
+            if await _is_blocked(page):
+                current_url = await _page_url(page)
+                print(f"[W{wid}] 🔓 Blocked detected — trying Web Unlocker for {current_url}")
+                html = await _fetch_via_unlocker(current_url)
+                if html:
+                    # Inject the unblocked HTML directly into the page
+                    escaped = html.replace('`', '\\`').replace('$', '\\$')
+                    await page.evaluate(f"""() => {{
+                        document.open();
+                        document.write(`{escaped[:500000]}`);
+                        document.close();
+                    }}""")
+                    print(f"[W{wid}] ✅ Unlocker HTML injected")
+
             # Longer random pauses every 5 steps
             if n % 5 == 0:
                 await human_delay_long()
@@ -754,11 +825,13 @@ async def _run_worker(
 
     async with _browser_semaphore:
         try:
-            browser_obj, warm_page, is_camoufox = await _create_browser_and_page(proxy, wid)
+            browser_obj, warm_page, raw_browser = await _create_browser_and_page(proxy, wid)
+            is_camoufox = raw_browser is not None  # raw_browser only set for Camoufox path
 
             # Run warm-up to establish realistic session
             if warm_page:
                 await _warmup_extended(warm_page, wid)
+                await warm_page.close()
 
             kwargs: dict = dict(
                 task=_wrap_prompt(request.prompt), llm=llm,
@@ -766,11 +839,21 @@ async def _run_worker(
                 use_vision=True, max_failures=3, retry_delay=2,
             )
 
-            if is_camoufox and browser_obj is not None:
-                try:
+            # Pass the correct browser object to the agent
+            if is_camoufox and raw_browser is not None:
+                # For Camoufox: pass the raw playwright browser
+                # browser-use expects a Browser wrapper, so wrap it
+                if BrowserConfig and Browser:
+                    try:
+                        brd_proxy = _proxy_browser_dict(proxy)
+                        cfg = BrowserConfig(proxy=brd_proxy)
+                        bu_browser = Browser(config=cfg)
+                        bu_browser._playwright_browser = raw_browser
+                        kwargs["browser"] = bu_browser
+                    except Exception:
+                        kwargs["browser"] = browser_obj
+                else:
                     kwargs["browser"] = browser_obj
-                except Exception:
-                    pass
             elif browser_obj is not None:
                 kwargs["browser"] = browser_obj
 
@@ -940,7 +1023,7 @@ async def startup_event():
 async def health() -> dict:
     return {
         "status": "ok",
-        "version": "6.2.0",
+        "version": "6.3.0",
         "browser": "camoufox" if CAMOUFOX_AVAILABLE else "chromium-fallback",
         "proxy": "bright-data-residential",
         "mode": "single-worker-warmup-enabled",
