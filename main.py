@@ -1,19 +1,12 @@
 """
-main.py  v6.1 — DEMO STEALTH MODE
+main.py  v6.2 — FIXED FOR DEMO
 ----------------------------------
-MAX stealth with Webshare proxies only (no residential needed for demo)
-
-CHANGES FROM v6:
-  ✅ Realistic mouse movements with bezier curves
-  ✅ Human-like scrolling (not instant scrollIntoView)
-  ✅ Variable typing speed with occasional backspaces
-  ✅ 5-15s random pauses between actions
-  ✅ Pre-browsing warm-up (3 pages before target)
-  ✅ Cookie persistence across steps
-  ✅ Disabled race mode (1 worker = less suspicious)
-  ✅ Extended timeout (5min per worker)
-  ✅ Random user agents pool
-  ✅ Realistic viewport sizes
+CHANGES FROM v6.1:
+  ✅ Bright Data residential proxy (single rotating endpoint)
+  ✅ Removed STEALTH_SCRIPT (conflicts with Camoufox, causes detection)
+  ✅ Re-enabled extended warm-up
+  ✅ Fixed human_scroll (non-uniform acceleration curve)
+  ✅ Credentials moved to .env only
 """
 from __future__ import annotations
 from typing import Any
@@ -47,25 +40,27 @@ from utils.helpers import create_and_upload_video
 
 load_dotenv()
 
-app = FastAPI(title="OnDemand Browser-Use Agent", version="6.1.0")
+app = FastAPI(title="OnDemand Browser-Use Agent", version="6.2.0")
 SCAN_DIR = "scans"
 os.makedirs(SCAN_DIR, exist_ok=True)
 
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
 WEBSHARE_API_KEY  = os.getenv("WEBSHARE_API_KEY", "")
-PROXY_USER        = os.getenv("PROXY_USER", "hgfumqbe")
-PROXY_PASS        = os.getenv("PROXY_PASS", "t8a93hs91l3r")
 
-# DEMO MODE: Single worker, longer timeout, multiple retries
-RACE_WORKERS      = 1   # Single worker = less suspicious
-RACE_MAX_ROUNDS   = 5   # Try 5 different proxies
-WORKER_TIMEOUT    = 300 # 5 minutes per attempt
+# Bright Data residential proxy — set these in your .env
+PROXY_USER = os.getenv("PROXY_USER", "brd-customer-hl_ea313532-zone-demo")
+PROXY_PASS = os.getenv("PROXY_PASS", "jzbld1hf9ygu")
+
+# Single worker, multiple rounds
+RACE_WORKERS      = 1
+RACE_MAX_ROUNDS   = 5
+WORKER_TIMEOUT    = 300
 MAX_BROWSERS      = 1
 
 _browser_semaphore = asyncio.Semaphore(MAX_BROWSERS)
 
 # ---------------------------------------------------------------------------
-# REALISTIC USER AGENTS POOL
+# USER AGENTS POOL
 # ---------------------------------------------------------------------------
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
@@ -76,7 +71,7 @@ USER_AGENTS = [
 ]
 
 # ---------------------------------------------------------------------------
-# REALISTIC VIEWPORT SIZES
+# VIEWPORT SIZES
 # ---------------------------------------------------------------------------
 VIEWPORTS = [
     {"width": 1920, "height": 1080},
@@ -86,13 +81,10 @@ VIEWPORTS = [
 ]
 
 # ---------------------------------------------------------------------------
-# PROXY POOL
+# PROXY POOL — Single Bright Data rotating residential endpoint
 # ---------------------------------------------------------------------------
 _HARDCODED_PROXIES = [
-    ("104.252.62.99", "5470"), ("45.248.55.14", "6600"), ("103.130.178.57", "5721"),
-    ("82.22.181.141", "7852"), ("192.46.188.160", "5819"), ("82.21.49.192", "7455"),
-    ("104.253.248.49", "5828"), ("140.233.168.158", "7873"), ("82.21.39.38", "7799"),
-    ("9.142.219.200",  "6364"),
+    ("brd.superproxy.io", "33335"),
 ]
 
 def _make_proxy(host: str, port: str) -> dict:
@@ -102,34 +94,8 @@ _PROXY_POOL: list[dict] = [_make_proxy(h, p) for h, p in _HARDCODED_PROXIES]
 _pool_refreshed_at: datetime = datetime.min
 
 async def _refresh_proxy_pool() -> None:
-    global _PROXY_POOL, _pool_refreshed_at
-    if not WEBSHARE_API_KEY:
-        print("[ProxyPool] No WEBSHARE_API_KEY — using hardcoded pool")
-        return
-    if datetime.utcnow() - _pool_refreshed_at < timedelta(hours=1):
-        return
-    print("[ProxyPool] Fetching from Webshare API…")
-    try:
-        proxies, page_num = [], 1
-        async with httpx.AsyncClient(timeout=15) as c:
-            while True:
-                r = await c.get(
-                    "https://proxy.webshare.io/api/v2/proxy/list/",
-                    headers={"Authorization": f"Token {WEBSHARE_API_KEY}"},
-                    params={"mode": "direct", "page": page_num, "page_size": 100},
-                )
-                data = r.json()
-                for p in data.get("results", []):
-                    proxies.append(_make_proxy(p["proxy_address"], str(p["port"])))
-                if not data.get("next"):
-                    break
-                page_num += 1
-        if proxies:
-            _PROXY_POOL = proxies
-            _pool_refreshed_at = datetime.utcnow()
-            print(f"[ProxyPool] ✅ Loaded {len(_PROXY_POOL)} proxies")
-    except Exception as exc:
-        print(f"[ProxyPool] Fetch failed: {exc}")
+    # Bright Data handles rotation automatically — no need to fetch pool
+    print(f"[ProxyPool] Using Bright Data residential proxy: {_PROXY_POOL[0]['host']}:{_PROXY_POOL[0]['port']}")
 
 def _proxy_browser_dict(p: dict) -> dict:
     return {"server": f"http://{p['host']}:{p['port']}", "username": p["user"], "password": p["pass"]}
@@ -140,96 +106,12 @@ def _proxy_httpx_url(p: dict) -> str:
 def _proxy_camoufox_dict(p: dict) -> dict:
     return {"server": f"http://{p['host']}:{p['port']}", "username": p["user"], "password": p["pass"]}
 
-# ---------------------------------------------------------------------------
-# STEALTH (JS fallback)
-# ---------------------------------------------------------------------------
-try:
-    from playwright_stealth import stealth_async as _stealth_async
-    STEALTH_LIB = True
-except ImportError:
-    STEALTH_LIB = False
-
 print("=" * 60)
 print(f"[Deploy] Camoufox          : {'✅' if CAMOUFOX_AVAILABLE else '❌ Chromium fallback'}")
 print(f"[Deploy] CAPSOLVER_API_KEY : {'✅' if CAPSOLVER_API_KEY else '❌'}")
-print(f"[Deploy] Demo Mode         : 1 worker, 5 rounds, 5min timeout")
+print(f"[Deploy] Proxy             : Bright Data Residential ✅")
+print(f"[Deploy] Mode              : 1 worker, 5 rounds, 5min timeout")
 print("=" * 60)
-
-STEALTH_SCRIPT = """
-Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-Object.defineProperty(navigator, 'plugins', { get: () => [
-    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-    { name: 'Native Client', filename: 'internal-nacl-plugin', description: '' },
-]});
-Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en', 'ar'] });
-Object.defineProperty(navigator, 'language', { get: () => 'en-US' });
-Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-Object.defineProperty(navigator, 'vendor', { get: () => 'Google Inc.' });
-Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
-Object.defineProperty(navigator, 'maxTouchPoints', { get: () => 0 });
-window.chrome = {
-    runtime: { id: undefined, connect: () => {}, sendMessage: () => {}, onMessage: { addListener: () => {}, removeListener: () => {} } },
-    loadTimes: () => ({ requestTime: Date.now()/1000 - Math.random(), wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2', connectionInfo: 'h2' }),
-    csi: () => ({ startE: Date.now()-500, onloadT: Date.now()-200, pageT: 1200, tran: 15 }), app: {},
-};
-const _oQ = window.navigator.permissions.query.bind(navigator.permissions);
-window.navigator.permissions.query = (p) => p.name === 'notifications' ? Promise.resolve({ state: Notification.permission }) : _oQ(p);
-const _oD = HTMLCanvasElement.prototype.toDataURL;
-HTMLCanvasElement.prototype.toDataURL = function(t, ...a) {
-    const c = this.getContext('2d');
-    if (c) { const d = c.getImageData(0,0,this.width||1,this.height||1); d.data[0]^=1; c.putImageData(d,0,0); }
-    return _oD.call(this, t, ...a);
-};
-const _oG = WebGLRenderingContext.prototype.getParameter;
-WebGLRenderingContext.prototype.getParameter = function(p) {
-    if (p===37445) return 'Intel Inc.'; if (p===37446) return 'Intel Iris OpenGL Engine';
-    return _oG.call(this, p);
-};
-try {
-    const _oG2 = WebGL2RenderingContext.prototype.getParameter;
-    WebGL2RenderingContext.prototype.getParameter = function(p) {
-        if (p===37445) return 'Intel Inc.'; if (p===37446) return 'Intel Iris OpenGL Engine';
-        return _oG2.call(this, p);
-    };
-} catch(e) {}
-Object.defineProperty(screen, 'width', { get: () => 1920 });
-Object.defineProperty(screen, 'height', { get: () => 1080 });
-Object.defineProperty(screen, 'availWidth', { get: () => 1920 });
-Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
-Object.defineProperty(screen, 'colorDepth', { get: () => 24 });
-Object.defineProperty(screen, 'pixelDepth', { get: () => 24 });
-try {
-    Object.defineProperty(navigator, 'connection', {
-        get: () => ({ effectiveType: '4g', rtt: 50+Math.floor(Math.random()*50), downlink: 10+Math.random()*5, saveData: false })
-    });
-} catch(e) {}
-"""
-
-async def _apply_cdp_stealth(bs) -> None:
-    if bs is None:
-        return
-    fn = getattr(bs, "_cdp_add_init_script", None)
-    if fn:
-        try:
-            await fn(STEALTH_SCRIPT) if asyncio.iscoroutinefunction(fn) else fn(STEALTH_SCRIPT)
-        except Exception:
-            pass
-    if STEALTH_LIB:
-        gp = getattr(bs, "_cdp_get_all_pages", None)
-        if gp:
-            try:
-                pages = await gp() if asyncio.iscoroutinefunction(gp) else gp()
-                for pg in (pages or []):
-                    if hasattr(pg, "add_init_script"):
-                        try:
-                            await _stealth_async(pg)
-                        except Exception:
-                            pass
-                        break
-            except Exception:
-                pass
 
 # ---------------------------------------------------------------------------
 # PAGE HELPERS
@@ -269,43 +151,37 @@ async def _frame_url(frame) -> str:
 async def human_mouse_move(page, to_x: int, to_y: int) -> None:
     """Bezier curve mouse movement"""
     try:
-        # Get current position
         current = await page.evaluate("() => [window.lastMouseX || 0, window.lastMouseY || 0]")
         start_x, start_y = current[0], current[1]
-        
-        # Generate bezier control points
+
         cp1_x = start_x + (to_x - start_x) * random.uniform(0.2, 0.4)
         cp1_y = start_y + (to_y - start_y) * random.uniform(0.2, 0.4) + random.randint(-50, 50)
         cp2_x = start_x + (to_x - start_x) * random.uniform(0.6, 0.8)
         cp2_y = start_y + (to_y - start_y) * random.uniform(0.6, 0.8) + random.randint(-50, 50)
-        
-        # Move in steps along curve
+
         steps = random.randint(15, 25)
         for i in range(steps + 1):
             t = i / steps
-            # Cubic bezier formula
             x = int((1-t)**3 * start_x + 3*(1-t)**2*t * cp1_x + 3*(1-t)*t**2 * cp2_x + t**3 * to_x)
             y = int((1-t)**3 * start_y + 3*(1-t)**2*t * cp1_y + 3*(1-t)*t**2 * cp2_y + t**3 * to_y)
-            
             await page.mouse.move(x, y)
             await asyncio.sleep(random.uniform(0.01, 0.03))
-        
-        # Store position for next move
+
         await page.evaluate(f"() => {{ window.lastMouseX = {to_x}; window.lastMouseY = {to_y}; }}")
     except Exception:
         pass
 
 async def human_scroll(page, distance: int = 300) -> None:
-    """Human-like scrolling with variable speed"""
+    """Human-like scrolling with acceleration curve (not uniform)"""
     try:
         scroll_steps = random.randint(8, 15)
-        step_size = distance / scroll_steps
-        
-        for _ in range(scroll_steps):
-            await page.evaluate(f"window.scrollBy(0, {step_size})")
-            await asyncio.sleep(random.uniform(0.05, 0.15))
-        
-        # Random pause after scroll
+        for i in range(scroll_steps):
+            # Acceleration curve — speeds up then slows down like a real human
+            progress = i / scroll_steps
+            ease = progress * (2 - progress)  # ease-in-out
+            step = (distance / scroll_steps) * ease * random.uniform(0.8, 1.2)
+            await page.evaluate(f"window.scrollBy(0, {step})")
+            await asyncio.sleep(random.uniform(0.05, 0.2))
         await asyncio.sleep(random.uniform(0.3, 0.8))
     except Exception:
         pass
@@ -330,31 +206,22 @@ async def _warmup_extended(page, wid: str) -> None:
         "https://www.linkedin.com",
         "https://www.bing.com/search?q=dubai+weather",
     ]
-    
+
     random.shuffle(sites)
-    
-    for i, site in enumerate(sites[:3]):  # Visit 3 sites
+
+    for i, site in enumerate(sites[:3]):
         try:
             print(f"[W{wid}] Warm-up {i+1}/3: {site}")
             nav = getattr(page, "goto", None) or getattr(page, "navigate", None)
             if nav:
                 await nav(site, timeout=20000)
-                
-                # Realistic user behavior on each page
                 await human_delay_short()
-                
-                # Random scroll
                 await human_scroll(page, random.randint(200, 600))
-                
-                # Random mouse movement
                 await human_mouse_move(page, random.randint(300, 1200), random.randint(200, 700))
-                
-                # Longer pause between pages
                 await asyncio.sleep(random.uniform(2.0, 4.0))
-                
         except Exception as e:
             print(f"[W{wid}] Warm-up {i+1} failed (non-fatal): {e}")
-    
+
     print(f"[W{wid}] ✅ Extended warm-up complete (3 pages)")
 
 # ---------------------------------------------------------------------------
@@ -467,35 +334,45 @@ async def _solve_captcha(page, proxy: dict) -> None:
                     cb = f.locator(".recaptcha-checkbox-border").first
                     if await cb.count() > 0:
                         await cb.click(timeout=3000)
-                        await asyncio.sleep(3)
+                        await asyncio.sleep(5)
                         nf = await _page_frames(page)
                         if not any("bframe" in (await _frame_url(x)) for x in nf):
+                            print("[CAPTCHA] reCAPTCHA checkbox passed ✅")
                             return
                 except Exception:
                     pass
                 break
+
         if not rc_key:
             m = _re.search(r'data-sitekey=["\']([^"\']+)["\']', html)
             if m:
                 rc_key = m.group(1)
+
         if rc_key and "6L" in rc_key:
-            print("[CAPTCHA] reCAPTCHA v2 detected — solving…")
+            print(f"[CAPTCHA] reCAPTCHA v2 detected (key: {rc_key[:20]}...) — solving…")
             sol = await _capsolver_solve(
                 {"type": "ReCaptchaV2Task", "websiteURL": purl, "websiteKey": rc_key}, proxy=proxy)
             if sol:
                 t = sol.get("gRecaptchaResponse", "")
-                await page.evaluate("""(t) => {
-                    document.querySelectorAll('[name="g-recaptcha-response"]')
-                        .forEach(el => { el.innerHTML=t; el.value=t; el.style.display='block'; });
-                    document.querySelectorAll('[data-callback]').forEach(el => {
-                        const cb=el.getAttribute('data-callback');
-                        if(cb&&window[cb]) try{window[cb](t);}catch(e){}
+                await page.evaluate("""(token) => {
+                    document.querySelectorAll('textarea[name="g-recaptcha-response"]').forEach(el => {
+                        el.innerHTML = token; el.value = token; el.style.display = 'block';
                     });
-                    const ta=document.querySelector('textarea[name="g-recaptcha-response"]');
-                    if(ta){const f=ta.closest('form');if(f)try{f.submit();}catch(e){}}
+                    document.querySelectorAll('[data-callback]').forEach(el => {
+                        const cb = el.getAttribute('data-callback');
+                        if (cb && window[cb]) { try { window[cb](token); } catch(e) {} }
+                    });
+                    const textarea = document.querySelector('textarea[name="g-recaptcha-response"]');
+                    if (textarea) {
+                        const form = textarea.closest('form');
+                        if (form) { setTimeout(() => { try { form.submit(); } catch(e) {} }, 500); }
+                    }
+                    const submitBtn = document.querySelector('button[type="submit"], input[type="submit"]');
+                    if (submitBtn) { setTimeout(() => submitBtn.click(), 1000); }
                 }""", t)
-                print("[CAPTCHA] reCAPTCHA solved ✅")
-            return
+                print("[CAPTCHA] reCAPTCHA token injected ✅")
+                await asyncio.sleep(5)
+                return
 
         # hCaptcha
         if "hcaptcha" in html.lower():
@@ -746,13 +623,18 @@ async def _create_browser_and_page(proxy: dict, wid: str):
     if CAMOUFOX_AVAILABLE:
         try:
             viewport = random.choice(VIEWPORTS)
+            camoufox_proxy = {
+                "server": f"http://{proxy['host']}:{proxy['port']}",
+                "username": proxy['user'],
+                "password": proxy['pass'],
+            }
             camoufox_ctx = AsyncCamoufox(
                 headless=True,
                 os="windows",
-                proxy=_proxy_camoufox_dict(proxy),
+                proxy=camoufox_proxy,
                 geoip=True,
-                humanize=True,
-                screen=viewport,  # Random viewport size
+                humanize=0.5,
+                screen={"width": viewport['width'], "height": viewport['height']},
             )
             browser = await camoufox_ctx.__aenter__()
             page = await browser.new_page()
@@ -837,25 +719,23 @@ async def _run_worker(
             if not pc[0]:
                 pc[0] = True
                 await _verify_proxy(proxy, wid)
-            if not CAMOUFOX_AVAILABLE:
-                await _apply_cdp_stealth(bs)
             page = await bs.get_current_page()
             if page is None:
                 return
-            
+
             # Human behavior every 3 steps
             if n % 3 == 0:
                 await human_scroll(page, random.randint(200, 400))
                 await human_mouse_move(page, random.randint(400, 1400), random.randint(300, 800))
-            
+
             await _solve_captcha(page, proxy)
-            
+
             # Longer random pauses every 5 steps
             if n % 5 == 0:
                 await human_delay_long()
             else:
                 await human_delay_short()
-            
+
             img = await page.screenshot()
             if isinstance(img, str):
                 img = base64.b64decode(img)
@@ -876,8 +756,8 @@ async def _run_worker(
         try:
             browser_obj, warm_page, is_camoufox = await _create_browser_and_page(proxy, wid)
 
-            # EXTENDED WARM-UP (3 pages)
-            if warm_page is not None:
+            # Run warm-up to establish realistic session
+            if warm_page:
                 await _warmup_extended(warm_page, wid)
 
             kwargs: dict = dict(
@@ -1021,23 +901,22 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
     await _refresh_proxy_pool()
 
     print(f"\n{'='*60}")
-    print(f"[Demo] Task    : {request.prompt[:80]}…")
-    print(f"[Demo] Browser : {'Camoufox 🦊' if CAMOUFOX_AVAILABLE else 'Chromium'}")
-    print(f"[Demo] Mode    : 1 worker, 5 rounds, 5min timeout, extended warm-up")
+    print(f"[Agent] Task   : {request.prompt[:80]}…")
+    print(f"[Agent] Browser: {'Camoufox 🦊' if CAMOUFOX_AVAILABLE else 'Chromium'}")
+    print(f"[Agent] Proxy  : Bright Data Residential ✅")
     print(f"{'='*60}\n")
 
     pool = list(_PROXY_POOL)
-    random.shuffle(pool)
 
     for rnd in range(1, RACE_MAX_ROUNDS + 1):
-        proxies = [pool[(rnd - 1) % len(pool)]]  # Single proxy per round
-        print(f"[Demo] Round {rnd}/5 — {proxies[0]['host']}")
+        proxies = [pool[0]]  # Single Bright Data endpoint — it rotates IPs automatically
+        print(f"[Agent] Round {rnd}/{RACE_MAX_ROUNDS}")
 
         winner = await _race(request, proxies)
 
         if winner is not None:
             wid, data, steps, vu = winner
-            print(f"\n[Demo] 🏆 Success in round {rnd}")
+            print(f"\n[Agent] 🏆 Success in round {rnd}")
             return AgentResponse(
                 video_url=vu,
                 steps_taken=steps,
@@ -1045,9 +924,9 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
                 worker_id=wid,
             )
 
-        print(f"[Demo] Round {rnd} failed, next proxy…")
+        print(f"[Agent] Round {rnd} failed, retrying with fresh IP…")
 
-    print("[Demo] ❌ All rounds exhausted")
+    print("[Agent] ❌ All rounds exhausted")
     return AgentResponse(video_url=None, steps_taken=0, extracted_data=None, worker_id=None)
 
 # ---------------------------------------------------------------------------
@@ -1061,8 +940,8 @@ async def startup_event():
 async def health() -> dict:
     return {
         "status": "ok",
-        "version": "6.1.0-demo-stealth",
+        "version": "6.2.0",
         "browser": "camoufox" if CAMOUFOX_AVAILABLE else "chromium-fallback",
-        "proxy_pool_size": len(_PROXY_POOL),
-        "mode": "single-worker-extended-warmup",
+        "proxy": "bright-data-residential",
+        "mode": "single-worker-warmup-enabled",
     }
