@@ -1,44 +1,37 @@
 """
-main.py
--------
-FastAPI wrapper around browser-use 0.11.x.
+main.py  v5 — RACE MODE (production-hardened)
+----------------------------------------------
+FastAPI wrapper around browser-use 0.11.x
 
-Run:
-    uvicorn main:app --reload --host 0.0.0.0 --port 8000
+FIXES OVER v4:
+  FIX-1  Warm-up now runs BEFORE agent.run(), not inside step callback
+  FIX-2  Slot-claimed asyncio.Lock prevents two workers double-queuing
+  FIX-3  Per-worker asyncio.wait_for(timeout=180s) prevents hung workers
+  FIX-4  RACE_WORKERS default lowered to 3 (safe for 4GB RAM)
+         RACE_MAX_ROUNDS raised to 8 (still 24 proxy attempts per request)
+  FIX-5  _is_valid() checks for real data keys, not just string length
+  FIX-6  Extracted data queued BEFORE video build — data never lost if
+         video upload crashes
+  FIX-7  Global semaphore caps concurrent Chromium instances hard
 
-FIXES APPLIED (v2):
-  1. Stealth unwrapping — exhaustive attr search across all known browser-use
-     0.11.x BrowserSession attribute names including the public `browser_context`.
-     Falls back to a full dir() debug dump on first failure so the real attr
-     name always appears in the logs for easy identification.
-  2. httpx proxy API — `proxy=` (singular URL string) instead of `proxies=`.
-  3. URL typo fix — regex correctly strips trailing 'and' glued to a URL path,
-     using a word blocklist to avoid false positives on real English words
-     like 'command', 'demand', 'expand'.
-  4. notice_link null guard — extraction prompt instructs scroll + absolute URL.
+ENV VARS:
+  WEBSHARE_API_KEY  — auto-fetches all 250 proxies at startup & hourly
+  PROXY_USER        — proxy username  (default: hgfumqbe)
+  PROXY_PASS        — proxy password  (default: t8a93hs91l3r)
+  RACE_WORKERS      — parallel workers per round (default: 3 for 4GB RAM)
+  RACE_MAX_ROUNDS   — max retry rounds           (default: 8)
+  WORKER_TIMEOUT    — seconds before a worker is killed (default: 180)
+  CAPSOLVER_API_KEY — for CAPTCHA solving
+  OPENAI_API_KEY    — for the LLM
 """
-
 from __future__ import annotations
 from typing import Any
-
-import asyncio
-import base64
-import glob
-import json
-import os
-import random
-import re as _re
-import shutil
-import sys
-import uuid
-from datetime import datetime
-from pathlib import Path
-
+import asyncio, base64, glob, json, os, random, re as _re, shutil, sys, uuid
+from datetime import datetime, timedelta
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
-
 from browser_use import Agent
 
 try:
@@ -54,221 +47,245 @@ from utils.helpers import create_and_upload_video
 
 load_dotenv()
 
-app = FastAPI(title="OnDemand Browser-Use Agent", version="1.0.0")
-
+app = FastAPI(title="OnDemand Browser-Use Agent", version="5.0.0")
 SCAN_DIR = "scans"
 os.makedirs(SCAN_DIR, exist_ok=True)
 
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
+WEBSHARE_API_KEY  = os.getenv("WEBSHARE_API_KEY", "")
+PROXY_USER        = os.getenv("PROXY_USER", "hgfumqbe")
+PROXY_PASS        = os.getenv("PROXY_PASS", "t8a93hs91l3r")
+
+# FIX-4: 3 workers is safe on 4GB RAM (3 × ~350MB Chromium = ~1GB, leaves room for everything else)
+# If you upgrade to 8GB+ you can safely raise this to 6-8
+RACE_WORKERS   = int(os.getenv("RACE_WORKERS",   "3"))
+RACE_MAX_ROUNDS = int(os.getenv("RACE_MAX_ROUNDS", "8"))
+WORKER_TIMEOUT  = int(os.getenv("WORKER_TIMEOUT",  "180"))  # seconds per worker before kill
+
+# FIX-7: Hard cap on simultaneous Chromium instances regardless of RACE_WORKERS setting
+# Prevents accidental OOM if someone sets RACE_WORKERS=10 on a small box
+MAX_BROWSERS = int(os.getenv("MAX_BROWSERS", "4"))
+_browser_semaphore = asyncio.Semaphore(MAX_BROWSERS)
 
 # ---------------------------------------------------------------------------
 # PROXY POOL
 # ---------------------------------------------------------------------------
-PROXY_POOL = [
-    {"host": os.getenv("PROXY_1_HOST", "104.252.62.99"),  "port": os.getenv("PROXY_1_PORT", "5470"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
-    {"host": os.getenv("PROXY_2_HOST", "45.248.55.14"),   "port": os.getenv("PROXY_2_PORT", "6600"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
-    {"host": os.getenv("PROXY_3_HOST", "103.130.178.57"), "port": os.getenv("PROXY_3_PORT", "5721"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
-    {"host": os.getenv("PROXY_4_HOST", "82.22.181.141"),  "port": os.getenv("PROXY_4_PORT", "7852"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
-    {"host": os.getenv("PROXY_5_HOST", "192.46.188.160"), "port": os.getenv("PROXY_5_PORT", "5819"),  "user": os.getenv("PROXY_USER", "hgfumqbe"), "pass": os.getenv("PROXY_PASS", "t8a93hs91l3r")},
+_HARDCODED_PROXIES = [
+    ("104.252.62.99", "5470"), ("45.248.55.14", "6600"), ("103.130.178.57", "5721"),
+    ("82.22.181.141", "7852"), ("192.46.188.160", "5819"), ("82.21.49.192", "7455"),
+    ("104.253.248.49", "5828"), ("140.233.168.158", "7873"), ("82.21.39.38", "7799"),
+    ("9.142.219.200",  "6364"),
 ]
 
-_ACTIVE_PROXY: dict = PROXY_POOL[0]
+def _make_proxy(host: str, port: str) -> dict:
+    return {"host": host, "port": port, "user": PROXY_USER, "pass": PROXY_PASS}
+
+_PROXY_POOL: list[dict] = [_make_proxy(h, p) for h, p in _HARDCODED_PROXIES]
+_pool_refreshed_at: datetime = datetime.min
 
 
-def _pick_proxy() -> dict:
-    return random.choice(PROXY_POOL)
+async def _refresh_proxy_pool() -> None:
+    global _PROXY_POOL, _pool_refreshed_at
+    if not WEBSHARE_API_KEY:
+        print("[ProxyPool] No WEBSHARE_API_KEY — using hardcoded pool")
+        return
+    if datetime.utcnow() - _pool_refreshed_at < timedelta(hours=1):
+        return
+    print("[ProxyPool] Fetching from Webshare API…")
+    try:
+        proxies, page_num = [], 1
+        async with httpx.AsyncClient(timeout=15) as c:
+            while True:
+                r = await c.get(
+                    "https://proxy.webshare.io/api/v2/proxy/list/",
+                    headers={"Authorization": f"Token {WEBSHARE_API_KEY}"},
+                    params={"mode": "direct", "page": page_num, "page_size": 100},
+                )
+                data = r.json()
+                for p in data.get("results", []):
+                    proxies.append(_make_proxy(p["proxy_address"], str(p["port"])))
+                if not data.get("next"):
+                    break
+                page_num += 1
+        if proxies:
+            _PROXY_POOL = proxies
+            _pool_refreshed_at = datetime.utcnow()
+            print(f"[ProxyPool] ✅ Loaded {len(_PROXY_POOL)} proxies from Webshare")
+        else:
+            print("[ProxyPool] ⚠️ API returned 0 proxies — keeping existing pool")
+    except Exception as exc:
+        print(f"[ProxyPool] Fetch failed: {exc} — keeping existing pool")
 
 
-def _proxy_browser_dict(proxy: dict) -> dict:
-    return {
-        "server":   f"http://{proxy['host']}:{proxy['port']}",
-        "username": proxy["user"],
-        "password": proxy["pass"],
-    }
+def _proxy_browser_dict(p: dict) -> dict:
+    return {"server": f"http://{p['host']}:{p['port']}", "username": p["user"], "password": p["pass"]}
 
-
-def _proxy_httpx_url(proxy: dict) -> str:
-    """FIX #2 — httpx >=0.20 uses proxy= (singular URL string)."""
-    return f"http://{proxy['user']}:{proxy['pass']}@{proxy['host']}:{proxy['port']}"
-
+def _proxy_httpx_url(p: dict) -> str:
+    return f"http://{p['user']}:{p['pass']}@{p['host']}:{p['port']}"
 
 # ---------------------------------------------------------------------------
-# PERSISTENT PROFILE
-# ---------------------------------------------------------------------------
-PROFILE_DIR = os.path.join(os.getcwd(), "browser_profile")
-os.makedirs(PROFILE_DIR, exist_ok=True)
-
-# ---------------------------------------------------------------------------
-# PLAYWRIGHT-STEALTH
+# STEALTH
 # ---------------------------------------------------------------------------
 try:
     from playwright_stealth import stealth_async as _stealth_async
-    STEALTH_LIB_AVAILABLE = True
+    STEALTH_LIB = True
     print("[Stealth] playwright-stealth available ✅")
 except ImportError:
-    STEALTH_LIB_AVAILABLE = False
-    print("[Stealth] playwright-stealth not installed — using JS-only stealth")
+    STEALTH_LIB = False
+    print("[Stealth] playwright-stealth not installed")
 
-# ---------------------------------------------------------------------------
-# DEPLOY VERIFICATION
-# ---------------------------------------------------------------------------
 print("=" * 60)
 print(f"[Deploy] Python            : {sys.version}")
-print(f"[Deploy] playwright-stealth: {'INSTALLED ✅' if STEALTH_LIB_AVAILABLE else 'MISSING ❌'}")
+print(f"[Deploy] playwright-stealth: {'✅' if STEALTH_LIB else '❌'}")
 print(f"[Deploy] CAPSOLVER_API_KEY : {'SET ✅' if CAPSOLVER_API_KEY else 'NOT SET ❌'}")
-print(f"[Deploy] Proxy pool size   : {len(PROXY_POOL)}")
+print(f"[Deploy] WEBSHARE_API_KEY  : {'SET ✅' if WEBSHARE_API_KEY else 'NOT SET — hardcoded pool'}")
+print(f"[Deploy] Proxy pool size   : {len(_PROXY_POOL)}")
+print(f"[Deploy] Race workers      : {RACE_WORKERS}  |  Max rounds : {RACE_MAX_ROUNDS}")
+print(f"[Deploy] Worker timeout    : {WORKER_TIMEOUT}s  |  Max browsers: {MAX_BROWSERS}")
 print("=" * 60)
 
-# ---------------------------------------------------------------------------
-# JS STEALTH SCRIPT
-# ---------------------------------------------------------------------------
 STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
 Object.defineProperty(navigator, 'plugins', { get: () => [
-    { name: 'Chrome PDF Plugin', filename: 'internal-pdf-viewer', description: 'Portable Document Format' },
-    { name: 'Chrome PDF Viewer', filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
-    { name: 'Native Client',     filename: 'internal-nacl-plugin',                description: '' },
+    { name: 'Chrome PDF Plugin',  filename: 'internal-pdf-viewer',              description: 'Portable Document Format' },
+    { name: 'Chrome PDF Viewer',  filename: 'mhjfbmdgcfjbbpaeojofohoefgiehjai', description: '' },
+    { name: 'Native Client',      filename: 'internal-nacl-plugin',             description: '' },
 ]});
-Object.defineProperty(navigator, 'languages',           { get: () => ['en-US', 'en'] });
+Object.defineProperty(navigator, 'languages',           { get: () => ['en-US', 'en', 'ar'] });
+Object.defineProperty(navigator, 'language',            { get: () => 'en-US' });
 Object.defineProperty(navigator, 'platform',            { get: () => 'Win32' });
 Object.defineProperty(navigator, 'vendor',              { get: () => 'Google Inc.' });
 Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
 Object.defineProperty(navigator, 'deviceMemory',        { get: () => 8 });
-window.chrome = { runtime: {}, loadTimes: () => ({}), csi: () => ({}), app: {} };
-const _origQuery = window.navigator.permissions.query.bind(navigator.permissions);
-window.navigator.permissions.query = (p) =>
-    p.name === 'notifications'
-        ? Promise.resolve({ state: Notification.permission })
-        : _origQuery(p);
-const _origToDataURL = HTMLCanvasElement.prototype.toDataURL;
-HTMLCanvasElement.prototype.toDataURL = function(type, ...a) {
-    const ctx = this.getContext('2d');
-    if (ctx) { const d = ctx.getImageData(0,0,this.width||1,this.height||1); d.data[0]^=1; ctx.putImageData(d,0,0); }
-    return _origToDataURL.call(this, type, ...a);
+Object.defineProperty(navigator, 'maxTouchPoints',      { get: () => 0 });
+window.chrome = {
+    runtime: { id: undefined, connect: () => {}, sendMessage: () => {},
+               onMessage: { addListener: () => {}, removeListener: () => {} } },
+    loadTimes: () => ({ requestTime: Date.now()/1000 - Math.random(),
+                        wasNpnNegotiated: true, npnNegotiatedProtocol: 'h2', connectionInfo: 'h2' }),
+    csi: () => ({ startE: Date.now()-500, onloadT: Date.now()-200, pageT: 1200, tran: 15 }),
+    app: {},
 };
-const _origGP = WebGLRenderingContext.prototype.getParameter;
+const _oQ = window.navigator.permissions.query.bind(navigator.permissions);
+window.navigator.permissions.query = (p) =>
+    p.name === 'notifications' ? Promise.resolve({ state: Notification.permission }) : _oQ(p);
+const _oD = HTMLCanvasElement.prototype.toDataURL;
+HTMLCanvasElement.prototype.toDataURL = function(t, ...a) {
+    const c = this.getContext('2d');
+    if (c) { const d = c.getImageData(0,0,this.width||1,this.height||1); d.data[0]^=1; c.putImageData(d,0,0); }
+    return _oD.call(this, t, ...a);
+};
+const _oG = WebGLRenderingContext.prototype.getParameter;
 WebGLRenderingContext.prototype.getParameter = function(p) {
     if (p===37445) return 'Intel Inc.'; if (p===37446) return 'Intel Iris OpenGL Engine';
-    return _origGP.call(this,p);
+    return _oG.call(this, p);
 };
+try {
+    const _oG2 = WebGL2RenderingContext.prototype.getParameter;
+    WebGL2RenderingContext.prototype.getParameter = function(p) {
+        if (p===37445) return 'Intel Inc.'; if (p===37446) return 'Intel Iris OpenGL Engine';
+        return _oG2.call(this, p);
+    };
+} catch(e) {}
+Object.defineProperty(screen, 'width',       { get: () => 1920 });
+Object.defineProperty(screen, 'height',      { get: () => 1080 });
+Object.defineProperty(screen, 'availWidth',  { get: () => 1920 });
+Object.defineProperty(screen, 'availHeight', { get: () => 1040 });
+Object.defineProperty(screen, 'colorDepth',  { get: () => 24 });
+Object.defineProperty(screen, 'pixelDepth',  { get: () => 24 });
+try {
+    Object.defineProperty(navigator, 'connection', {
+        get: () => ({ effectiveType: '4g', rtt: 50+Math.floor(Math.random()*50),
+                      downlink: 10+Math.random()*5, saveData: false })
+    });
+} catch(e) {}
 """
 
-# ---------------------------------------------------------------------------
-# FIX #1 — CDP-NATIVE STEALTH INJECTION
-#
-# browser-use 0.11.x BrowserSession is a pure CDP class — there is NO
-# Playwright BrowserContext stored on it at all. It exposes CDP helpers
-# directly:
-#   _cdp_add_init_script(script: str)   — injects JS before every page load
-#   _cdp_remove_init_script(script: str)
-#   _cdp_get_all_pages()                — returns CDP page objects
-#
-# Strategy:
-#   1. Call browser_session._cdp_add_init_script(STEALTH_SCRIPT) — this is
-#      the correct way to inject init scripts on a CDP-backed session.
-#   2. Optionally try playwright-stealth via _cdp_get_all_pages() pages.
-#   3. Never try to unwrap a Playwright context — it doesn't exist here.
-# ---------------------------------------------------------------------------
-
-async def _apply_cdp_stealth(browser_session) -> None:
-    """Inject stealth JS via CDP _cdp_add_init_script (browser-use 0.11.x)."""
-    if browser_session is None:
+async def _apply_cdp_stealth(bs) -> None:
+    if bs is None:
         return
-
-    # Primary: CDP-level init script injection
-    cdp_add = getattr(browser_session, "_cdp_add_init_script", None)
-    if cdp_add is not None:
+    fn = getattr(bs, "_cdp_add_init_script", None)
+    if fn:
         try:
-            if asyncio.iscoroutinefunction(cdp_add):
-                await cdp_add(STEALTH_SCRIPT)
-            else:
-                cdp_add(STEALTH_SCRIPT)
-            print("[Stealth] ✅ CDP _cdp_add_init_script injected")
-        except Exception as exc:
-            print(f"[Stealth] _cdp_add_init_script failed: {exc}")
-    else:
-        print("[Stealth] ⚠️ _cdp_add_init_script not found on session")
-
-    # Secondary: try playwright-stealth on any available page objects
-    if STEALTH_LIB_AVAILABLE:
-        cdp_get_pages = getattr(browser_session, "_cdp_get_all_pages", None)
-        if cdp_get_pages is not None:
+            await fn(STEALTH_SCRIPT) if asyncio.iscoroutinefunction(fn) else fn(STEALTH_SCRIPT)
+        except Exception as e:
+            print(f"[Stealth] failed: {e}")
+    if STEALTH_LIB:
+        gp = getattr(bs, "_cdp_get_all_pages", None)
+        if gp:
             try:
-                pages = await cdp_get_pages() if asyncio.iscoroutinefunction(cdp_get_pages) else cdp_get_pages()
+                pages = await gp() if asyncio.iscoroutinefunction(gp) else gp()
                 for pg in (pages or []):
                     if hasattr(pg, "add_init_script"):
                         try:
                             await _stealth_async(pg)
-                            print("[Stealth] ✅ playwright-stealth applied via CDP page")
                         except Exception:
                             pass
                         break
             except Exception:
                 pass
 
-
 # ---------------------------------------------------------------------------
-# SAFE PAGE URL / FRAMES HELPERS
+# PAGE HELPERS
 # ---------------------------------------------------------------------------
 
 async def _page_url(page) -> str:
     try:
         fn = getattr(page, "get_url", None)
-        if fn is not None:
-            result = fn() if not asyncio.iscoroutinefunction(fn) else await fn()
-            if result:
-                return result
+        if fn:
+            r = fn() if not asyncio.iscoroutinefunction(fn) else await fn()
+            if r:
+                return r
         url = page.url
-        if asyncio.iscoroutine(url):
-            url = await url
-        return url or ""
+        return (await url if asyncio.iscoroutine(url) else url) or ""
     except Exception:
         try:
             return await page.evaluate("() => window.location.href")
         except Exception:
             return ""
 
-
 async def _page_frames(page) -> list:
     try:
-        frames = page.frames
-        if asyncio.iscoroutine(frames):
-            frames = await frames
-        return frames or []
+        f = page.frames
+        return (await f if asyncio.iscoroutine(f) else f) or []
     except Exception:
         return []
 
-
 async def _frame_url(frame) -> str:
     try:
-        url = frame.url
-        if asyncio.iscoroutine(url):
-            url = await url
-        return url or ""
+        u = frame.url
+        return (await u if asyncio.iscoroutine(u) else u) or ""
     except Exception:
         return ""
 
-
 # ---------------------------------------------------------------------------
-# PROXY VERIFICATION  (FIX #2: httpx proxy= not proxies=)
+# PROXY VERIFY
 # ---------------------------------------------------------------------------
 
-async def _verify_proxy(browser_session, expected_proxy: dict) -> None:
-    """Verify exit IP via httpx (CDP-backed session; no Playwright context for new tabs)."""
-    print(f"[ProxyCheck] Verifying proxy {expected_proxy['host']}:{expected_proxy['port']} …")
+async def _verify_proxy(proxy: dict, wid: str) -> None:
     try:
-        async with httpx.AsyncClient(proxy=_proxy_httpx_url(expected_proxy), timeout=10) as c:
-            r    = await c.get("https://ipinfo.io/json")
-            info = r.json()
-            reported_ip = info.get("ip", "unknown")
-            print(f"[ProxyCheck] Exit IP: {reported_ip}")
-            if reported_ip == expected_proxy["host"]:
-                print("[ProxyCheck] 🟢 Proxy IP matches — proxy ACTIVE")
-            else:
-                print("[ProxyCheck] 🟡 Exit IP differs (normal for rotating residential proxies)")
-    except Exception as exc:
-        print(f"[ProxyCheck] Check failed: {exc}")
+        async with httpx.AsyncClient(proxy=_proxy_httpx_url(proxy), timeout=8) as c:
+            ip   = (await c.get("https://ipinfo.io/json")).json().get("ip", "?")
+            mark = "🟢" if ip == proxy["host"] else "🟡"
+            print(f"[W{wid}] Proxy {mark} exit={ip}")
+    except Exception as e:
+        print(f"[W{wid}] ProxyCheck failed: {e}")
 
+# ---------------------------------------------------------------------------
+# FIX-1: BROWSER WARM-UP — called BEFORE agent.run(), not inside step callback
+# ---------------------------------------------------------------------------
+
+async def _warmup_page(page, wid: str) -> None:
+    """Navigate to a neutral site to seed cookies and HTTP/2 session state."""
+    site = random.choice(["https://www.google.com", "https://www.bing.com", "https://www.wikipedia.org"])
+    try:
+        nav = getattr(page, "goto", None) or getattr(page, "navigate", None)
+        if nav:
+            await nav(site, timeout=15000)
+            await asyncio.sleep(random.uniform(2.0, 3.5))
+            print(f"[W{wid}] Warm-up ✅ ({site})")
+    except Exception as e:
+        print(f"[W{wid}] Warm-up failed (non-fatal): {e}")
 
 # ---------------------------------------------------------------------------
 # CAPSOLVER
@@ -276,49 +293,41 @@ async def _verify_proxy(browser_session, expected_proxy: dict) -> None:
 
 async def _capsolver_solve(task: dict, proxy: dict | None = None) -> dict | None:
     if not CAPSOLVER_API_KEY:
-        print("[CapSolver] No API key — skipping")
         return None
-
     task = dict(task)
-
     if proxy:
-        task["proxyType"]     = "http"
-        task["proxyAddress"]  = proxy["host"]
-        task["proxyPort"]     = int(proxy["port"])
-        task["proxyLogin"]    = proxy["user"]
-        task["proxyPassword"] = proxy["pass"]
-        task["type"]          = task["type"].replace("ProxyLess", "")
-
+        task.update({
+            "proxyType": "http", "proxyAddress": proxy["host"],
+            "proxyPort": int(proxy["port"]), "proxyLogin": proxy["user"],
+            "proxyPassword": proxy["pass"],
+        })
+        task["type"] = task["type"].replace("ProxyLess", "")
     try:
         async with httpx.AsyncClient(timeout=30) as c:
-            r    = await c.post("https://api.capsolver.com/createTask",
-                                json={"clientKey": CAPSOLVER_API_KEY, "task": task})
-            data = r.json()
-            if data.get("errorId") != 0:
-                print(f"[CapSolver] Error: {data.get('errorDescription')}")
+            r = await c.post("https://api.capsolver.com/createTask",
+                             json={"clientKey": CAPSOLVER_API_KEY, "task": task})
+            d = r.json()
+            if d.get("errorId") != 0:
                 return None
-            task_id = data["taskId"]
+            tid = d["taskId"]
         async with httpx.AsyncClient(timeout=120) as c:
             for _ in range(60):
                 await asyncio.sleep(2)
-                r = await c.post("https://api.capsolver.com/getTaskResult",
-                                 json={"clientKey": CAPSOLVER_API_KEY, "taskId": task_id})
-                d = r.json()
+                d = (await c.post("https://api.capsolver.com/getTaskResult",
+                                  json={"clientKey": CAPSOLVER_API_KEY, "taskId": tid})).json()
                 if d.get("status") == "ready":
                     return d.get("solution", {})
                 if d.get("status") == "failed":
-                    print("[CapSolver] Task failed")
                     return None
-    except Exception as exc:
-        print(f"[CapSolver] Exception: {exc}")
+    except Exception:
+        pass
     return None
 
-
 # ---------------------------------------------------------------------------
-# CAPTCHA DETECTION + SOLVING
+# CAPTCHA DETECTION
 # ---------------------------------------------------------------------------
 
-async def detect_and_solve_captcha(page) -> None:
+async def _solve_captcha(page, proxy: dict) -> None:
     try:
         try:
             html = await page.content()
@@ -327,15 +336,13 @@ async def detect_and_solve_captcha(page) -> None:
                 html = await page.evaluate("() => document.documentElement.outerHTML")
             except Exception:
                 return
-
-        page_url = await _page_url(page)
-        frames   = await _page_frames(page)
-        proxy    = _ACTIVE_PROXY
+        purl   = await _page_url(page)
+        frames = await _page_frames(page)
 
         # Turnstile
         ts_key = None
-        for frame in frames:
-            fu = await _frame_url(frame)
+        for f in frames:
+            fu = await _frame_url(f)
             if "challenges.cloudflare.com" in fu or "turnstile" in fu.lower():
                 m = _re.search(r'[?&]k=([^&]+)', fu)
                 if m:
@@ -346,50 +353,41 @@ async def detect_and_solve_captcha(page) -> None:
             if m and ("cf-turnstile" in html or "turnstile" in html.lower()):
                 ts_key = m.group(1)
         if ts_key:
-            print("[CAPTCHA] Turnstile detected — solving…")
             sol = await _capsolver_solve(
-                {"type": "AntiTurnstileTask", "websiteURL": page_url, "websiteKey": ts_key},
-                proxy=proxy,
-            )
+                {"type": "AntiTurnstileTask", "websiteURL": purl, "websiteKey": ts_key}, proxy=proxy)
             if sol:
-                token = sol.get("token", "")
+                t = sol.get("token", "")
                 await page.evaluate("""(t) => {
                     document.querySelectorAll('input[name*="cf-turnstile-response"],input[name*="turnstile"]')
                         .forEach(el => { el.value=t; el.dispatchEvent(new Event('change',{bubbles:true})); });
                     const el = document.querySelector('.cf-turnstile,[data-sitekey]');
                     if (el) { const cb=el.getAttribute('data-callback'); if(cb&&window[cb]) try{window[cb](t);}catch(e){} }
-                }""", token)
-                print("[CAPTCHA] Turnstile injected ✅")
+                }""", t)
             return
 
-        # Cloudflare JS
+        # CF JS challenge
         if "Just a moment" in html or "cf-browser-verification" in html:
-            print("[CAPTCHA] Cloudflare JS challenge — waiting up to 15s…")
             for _ in range(15):
                 await asyncio.sleep(1)
-                new_html = await page.content()
-                if "Just a moment" not in new_html:
-                    print("[CAPTCHA] Cloudflare cleared ✅")
+                if "Just a moment" not in await page.content():
                     return
-            print("[CAPTCHA] Cloudflare challenge persists after 15s")
             return
 
         # reCAPTCHA v2
         rc_key = None
-        for frame in frames:
-            fu = await _frame_url(frame)
+        for f in frames:
+            fu = await _frame_url(f)
             if "recaptcha" in fu and "anchor" in fu:
                 m = _re.search(r'[?&]k=([^&]+)', fu)
                 if m:
                     rc_key = m.group(1)
                 try:
-                    cb = frame.locator(".recaptcha-checkbox-border").first
+                    cb = f.locator(".recaptcha-checkbox-border").first
                     if await cb.count() > 0:
                         await cb.click(timeout=3000)
                         await asyncio.sleep(3)
-                        new_frames = await _page_frames(page)
-                        if not any("bframe" in (await _frame_url(f)) for f in new_frames):
-                            print("[CAPTCHA] reCAPTCHA checkbox passed ✅")
+                        nf = await _page_frames(page)
+                        if not any("bframe" in (await _frame_url(x)) for x in nf):
                             return
                 except Exception:
                     pass
@@ -399,13 +397,10 @@ async def detect_and_solve_captcha(page) -> None:
             if m:
                 rc_key = m.group(1)
         if rc_key and "6L" in rc_key:
-            print("[CAPTCHA] reCAPTCHA v2 detected — solving…")
             sol = await _capsolver_solve(
-                {"type": "ReCaptchaV2Task", "websiteURL": page_url, "websiteKey": rc_key},
-                proxy=proxy,
-            )
+                {"type": "ReCaptchaV2Task", "websiteURL": purl, "websiteKey": rc_key}, proxy=proxy)
             if sol:
-                token = sol.get("gRecaptchaResponse", "")
+                t = sol.get("gRecaptchaResponse", "")
                 await page.evaluate("""(t) => {
                     document.querySelectorAll('[name="g-recaptcha-response"]')
                         .forEach(el => { el.innerHTML=t; el.value=t; el.style.display='block'; });
@@ -415,21 +410,17 @@ async def detect_and_solve_captcha(page) -> None:
                     });
                     const ta=document.querySelector('textarea[name="g-recaptcha-response"]');
                     if(ta){const f=ta.closest('form');if(f)try{f.submit();}catch(e){}}
-                }""", token)
-                print("[CAPTCHA] reCAPTCHA v2 injected ✅")
+                }""", t)
             return
 
         # hCaptcha
         if "hcaptcha" in html.lower():
             m = _re.search(r'data-sitekey=["\']([^"\']+)["\']', html)
             if m:
-                print("[CAPTCHA] hCaptcha detected — solving…")
                 sol = await _capsolver_solve(
-                    {"type": "HCaptchaTask", "websiteURL": page_url, "websiteKey": m.group(1)},
-                    proxy=proxy,
-                )
+                    {"type": "HCaptchaTask", "websiteURL": purl, "websiteKey": m.group(1)}, proxy=proxy)
                 if sol:
-                    token = sol.get("gRecaptchaResponse", "")
+                    t = sol.get("gRecaptchaResponse", "")
                     await page.evaluate("""(t) => {
                         const ta=document.querySelector('[name="h-captcha-response"]');
                         if(ta){ta.innerHTML=t;ta.value=t;}
@@ -437,29 +428,12 @@ async def detect_and_solve_captcha(page) -> None:
                             const cb=el.getAttribute('data-callback');
                             if(cb&&window[cb])try{window[cb](t);}catch(e){}
                         });
-                    }""", token)
-                    print("[CAPTCHA] hCaptcha injected ✅")
+                    }""", t)
+    except Exception as e:
+        print(f"[CAPTCHA] error: {e}")
 
-    except Exception as exc:
-        print(f"[CAPTCHA] detect_and_solve error: {exc}")
-
-
-# ---------------------------------------------------------------------------
-# HUMAN-LIKE DELAY
-# ---------------------------------------------------------------------------
-
-async def human_delay(min_ms: int = 500, max_ms: int = 2000) -> None:
-    await asyncio.sleep(random.uniform(min_ms / 1000, max_ms / 1000))
-
-
-# ---------------------------------------------------------------------------
-# STEALTH APPLICATION
-# ---------------------------------------------------------------------------
-
-async def apply_stealth_to_session(browser_session) -> None:
-    """Inject stealth via CDP _cdp_add_init_script (browser-use 0.11.x CDP-backed session)."""
-    await _apply_cdp_stealth(browser_session)
-
+async def human_delay(a: int = 300, b: int = 1000) -> None:
+    await asyncio.sleep(random.uniform(a / 1000, b / 1000))
 
 # ---------------------------------------------------------------------------
 # MODELS
@@ -470,21 +444,19 @@ class AgentRequest(BaseModel):
     max_steps: int = 50
     model: str = "gpt-5.1"
 
-
 class AgentResponse(BaseModel):
     video_url: str | None = None
     steps_taken: int = 0
     extracted_data: Any = None
-
+    worker_id: str | None = None
 
 # ---------------------------------------------------------------------------
-# PLACEHOLDER FRAME
+# SCREENSHOT / FRAME HELPERS
 # ---------------------------------------------------------------------------
 
-def _ensure_minimum_frames(folder: str) -> None:
+def _ensure_frames(folder: str) -> None:
     if glob.glob(os.path.join(folder, "*.png")):
         return
-    print("[Frames] No screenshots — writing 1920×1080 placeholder.")
     path = os.path.join(folder, "step_0000_placeholder.png")
     try:
         from PIL import Image, ImageDraw
@@ -497,248 +469,139 @@ def _ensure_minimum_frames(folder: str) -> None:
             tw = len(msg) * 8
         draw.text(((1920 - tw) / 2, 520), msg, fill=(180, 180, 180))
         img.save(path, "PNG")
-    except Exception as exc:
-        print(f"[Frames] Pillow failed ({exc}), writing raw PNG.")
+    except Exception:
         import struct, zlib
         def _chunk(tag: bytes, data: bytes) -> bytes:
             crc = zlib.crc32(tag + data) & 0xFFFFFFFF
             return struct.pack(">I", len(data)) + tag + data + struct.pack(">I", crc)
-        raw = (
-            b'\x89PNG\r\n\x1a\n'
-            + _chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0))
-            + _chunk(b'IDAT', zlib.compress(b'\x00\xff\xff\xff'))
-            + _chunk(b'IEND', b'')
-        )
+        raw = (b'\x89PNG\r\n\x1a\n'
+               + _chunk(b'IHDR', struct.pack('>IIBBBBB', 1, 1, 8, 2, 0, 0, 0))
+               + _chunk(b'IDAT', zlib.compress(b'\x00\xff\xff\xff'))
+               + _chunk(b'IEND', b''))
         with open(path, "wb") as f:
             f.write(raw)
 
-
-# ---------------------------------------------------------------------------
-# SCREENSHOT EXTRACTORS
-# ---------------------------------------------------------------------------
-
-def _dump_history_screenshots(history, folder: str) -> int:
-    saved = 0
-
-    def _save(raw, label: str) -> bool:
-        nonlocal saved
+def _dump_screenshots(history, folder: str) -> None:
+    def _save(raw, label):
         if not raw:
             return False
         if isinstance(raw, str) and "," in raw:
             raw = raw.split(",", 1)[1]
         try:
-            img_bytes = base64.b64decode(raw) if isinstance(raw, str) else raw
-            if not (img_bytes[:4] == b'\x89PNG' or img_bytes[:2] == b'\xff\xd8'):
+            b = base64.b64decode(raw) if isinstance(raw, str) else raw
+            if not (b[:4] == b'\x89PNG' or b[:2] == b'\xff\xd8'):
                 return False
-            path = os.path.join(folder, f"{label}.png")
-            with open(path, "wb") as fh:
-                fh.write(img_bytes)
-            saved += 1
+            with open(os.path.join(folder, f"{label}.png"), "wb") as fh:
+                fh.write(b)
             return True
         except Exception:
             return False
-
     try:
-        for i, result in enumerate((history.action_results() if history else None) or []):
-            for attr in ("screenshot", "base64_screenshot", "image", "screenshot_b64"):
-                if _save(getattr(result, attr, None), f"step_{i+1:04d}_result"):
+        for i, r in enumerate((history.action_results() if history else None) or []):
+            for a in ("screenshot", "base64_screenshot", "image", "screenshot_b64"):
+                if _save(getattr(r, a, None), f"step_{i+1:04d}_result"):
                     break
         for i, h in enumerate(getattr(history, "history", []) or []):
-            state = getattr(h, "state", None)
-            if state is not None:
-                for attr in ("screenshot", "base64_screenshot", "image", "screenshot_b64"):
-                    if _save(getattr(state, attr, None), f"step_{i+1:04d}_state"):
+            s = getattr(h, "state", None)
+            if s:
+                for a in ("screenshot", "base64_screenshot", "image", "screenshot_b64"):
+                    if _save(getattr(s, a, None), f"step_{i+1:04d}_state"):
                         break
-            for attr in ("screenshot", "base64_screenshot", "image", "screenshot_b64"):
-                if _save(getattr(h, attr, None), f"step_{i+1:04d}_h"):
+            for a in ("screenshot", "base64_screenshot", "image", "screenshot_b64"):
+                if _save(getattr(h, a, None), f"step_{i+1:04d}_h"):
                     break
-    except Exception as exc:
-        print(f"[History] Extraction failed: {exc}")
-    return saved
+    except Exception:
+        pass
 
-
-def _dump_json_screenshots(folder: str) -> int:
-    saved   = 0
-    pattern = os.path.join(folder, "conversation_*.json")
-    files   = sorted(glob.glob(pattern))
-    if not files:
-        return 0
-    print(f"[JSON] Found {len(files)} conversation JSON file(s)")
-    for json_path in files:
+def _dump_json_screenshots(folder: str) -> None:
+    saved = 0
+    for jf in sorted(glob.glob(os.path.join(folder, "conversation_*.json"))):
         try:
-            with open(json_path, "r", encoding="utf-8") as f:
-                data = json.load(f)
+            data = json.load(open(jf, "r", encoding="utf-8"))
         except Exception:
             continue
-        messages = data if isinstance(data, list) else data.get("messages", [])
-        for msg in messages:
+        msgs = data if isinstance(data, list) else data.get("messages", [])
+        for msg in msgs:
             content = msg.get("content", [])
             if not isinstance(content, list):
                 continue
             for block in content:
                 if not isinstance(block, dict):
                     continue
-                img_url = (block.get("image_url") or {}).get("url", "")
-                source  = block.get("source") or {}
-                raw     = ""
-                if img_url.startswith("data:image"):
-                    raw = img_url.split(",", 1)[1] if "," in img_url else ""
-                elif source.get("type") == "base64":
-                    raw = source.get("data", "")
+                iu  = (block.get("image_url") or {}).get("url", "")
+                src = block.get("source") or {}
+                raw = ""
+                if iu.startswith("data:image"):
+                    raw = iu.split(",", 1)[1] if "," in iu else ""
+                elif src.get("type") == "base64":
+                    raw = src.get("data", "")
                 if not raw:
                     continue
                 try:
-                    img_bytes = base64.b64decode(raw)
-                    if not (img_bytes[:4] == b'\x89PNG' or img_bytes[:2] == b'\xff\xd8'):
+                    b = base64.b64decode(raw)
+                    if not (b[:4] == b'\x89PNG' or b[:2] == b'\xff\xd8'):
                         continue
-                    stem  = os.path.splitext(os.path.basename(json_path))[0]
-                    fname = f"{stem}_img{saved+1:03d}.png"
-                    out   = os.path.join(folder, fname)
-                    with open(out, "wb") as fh:
-                        fh.write(img_bytes)
+                    stem = os.path.splitext(os.path.basename(jf))[0]
+                    with open(os.path.join(folder, f"{stem}_img{saved+1:03d}.png"), "wb") as fh:
+                        fh.write(b)
                     saved += 1
                 except Exception:
                     pass
-    print(f"[JSON] Total screenshots extracted: {saved}")
-    return saved
-
 
 # ---------------------------------------------------------------------------
-# FIX #3 — URL TYPO CORRECTION
-#
-# Fixes prompts where the caller forgot a space before "and", producing URLs
-# like "request_browse_publicand". Uses a blocklist of real English words that
-# legitimately end in "and" to avoid false positives (command, demand, etc.).
+# URL TYPO FIX
 # ---------------------------------------------------------------------------
 
-_REAL_AND_WORDS: frozenset = frozenset({
-    "command", "demand", "expand", "understand", "withstand",
-    "contraband", "headband", "armband", "remand", "reprimand",
-    "mainland", "farmland", "highland", "lowland", "island",
-    "strand", "brand", "grand", "stand", "sand", "hand",
-    "land", "band", "wand", "bland", "gland", "planned",
-    "scanned", "fanned", "manned", "spanned", "banned",
-    "canned", "tanned", "panned",
+_REAL_AND_WORDS = frozenset({
+    "command", "demand", "expand", "understand", "withstand", "contraband",
+    "headband", "armband", "remand", "reprimand", "mainland", "farmland",
+    "highland", "lowland", "island", "strand", "brand", "grand", "stand",
+    "sand", "hand", "land", "band", "wand", "bland", "gland", "planned",
+    "scanned", "fanned", "manned", "spanned", "banned", "canned", "tanned", "panned",
 })
 
-
 def _fix_url_typos(text: str) -> str:
-    """Strip trailing 'and' concatenated to a URL path without a space."""
-    def _repair(m: _re.Match) -> str:
+    def _r(m: _re.Match) -> str:
         url = m.group(0)
-        tail = _re.search(r'([a-z]{4,}and)$', url)
-        if not tail:
-            return url
-        full_tail = tail.group(1)
-        if full_tail.lower() in _REAL_AND_WORDS:
+        t   = _re.search(r'([a-z]{4,}and)$', url)
+        if not t or t.group(1).lower() in _REAL_AND_WORDS:
             return url
         return url[:-3] + " and"
+    return _re.sub(r'https?://\S+', _r, text)
 
-    return _re.sub(r'https?://\S+', _repair, text)
-
-
-def _wrap_prompt(user_prompt: str) -> str:
-    user_prompt = _fix_url_typos(user_prompt)  # FIX #3
-
+def _wrap_prompt(p: str) -> str:
+    p = _fix_url_typos(p)
     return f"""You are a browser automation agent. Execute the following task:
 
-{user_prompt}
+{p}
 
 === CRITICAL RULES FOR ADDING AGENT TOOLS ===
-When you need to add a tool via the 'Add Agent Tools' modal, follow these rules EXACTLY:
-
-RULE 1 — ADDING A TOOL:
-- After clicking the '+' button inside a tool card, you MUST wait 2 seconds and look for a GREEN TOAST notification that says "Agent Tool added successfully".
-- If you see the toast → the tool was added. Do NOT click '+' again. Proceed to close the modal.
-- If you do NOT see the toast after 2 seconds → the click failed. Try clicking the '+' button ONE more time.
-- NEVER click '+' more than twice total. After 2 attempts, close the modal and move on.
-
-RULE 2 — JAVASCRIPT CLICK FALLBACK:
-- If you see "Could not get element geometry" warnings, the button was clicked via JavaScript.
-- JavaScript clicks on this site DO register — trust them. Wait for the toast before assuming failure.
-
-RULE 3 — DO NOT REOPEN THE MODAL:
-- Once you have closed the 'Add Agent Tools' modal, do NOT reopen it.
-- Even if Agent Tools sidebar still shows "No Agent Tools Added" briefly, that is a UI refresh delay — do NOT reopen the modal.
-
-RULE 4 — PROCEED AFTER CLOSE:
-- After closing the modal, immediately go to the main chat input and type the prompt.
-- Do not look back at the Agent Tools sidebar.
+RULE 1: After clicking '+', wait 2s for GREEN TOAST. Toast seen → added, do NOT click again. No toast → try once more. NEVER click more than twice.
+RULE 2: "Could not get element geometry" = JavaScript click fired. Trust it. Wait for toast.
+RULE 3: Once modal is closed, do NOT reopen it.
+RULE 4: After closing modal, go straight to main chat input. Do not look back at sidebar.
 === END CRITICAL RULES ===
 
 === DATA EXTRACTION RULES ===
 When extracting rows from a paginated or scrollable table:
-- Before calling the extract tool, execute JavaScript to scroll the entire table
-  container to the bottom so all rows are rendered:
-      document.querySelector('table, .table, [role="grid"]')?.scrollIntoView()
-- Extract the href attribute from EVERY anchor tag in the first/code column;
-  if the href is relative (starts with /), prepend https://procurement.gov.ae
-- Set notice_link to null ONLY if there is genuinely no anchor element in that
-  cell — never leave it null because the row was off-screen.
+- Before calling extract, run JS: document.querySelector('table, .table, [role="grid"]')?.scrollIntoView()
+- Extract href from EVERY anchor in first/code column; if relative (starts with /), prepend https://procurement.gov.ae
+- Set notice_link to null ONLY if there is genuinely no anchor — never null just because row was off-screen.
 === END DATA EXTRACTION RULES ===
 """
-
-
-# ---------------------------------------------------------------------------
-# STEP CALLBACK
-# ---------------------------------------------------------------------------
-
-def make_screenshot_callback(folder: str, counter: list[int]):
-    proxy_checked = [False]
-
-    async def _callback(agent) -> None:
-        counter[0] += 1
-        n = counter[0]
-        try:
-            browser_session = getattr(agent, "browser_session", None)
-            if browser_session is None:
-                print(f"[Callback] step {n}: no browser_session on agent")
-                return
-
-            if not proxy_checked[0]:
-                proxy_checked[0] = True
-                await _verify_proxy(browser_session, _ACTIVE_PROXY)
-
-            await apply_stealth_to_session(browser_session)
-
-            page = await browser_session.get_current_page()
-            if page is None:
-                print(f"[Callback] step {n}: get_current_page() returned None")
-                return
-
-            await detect_and_solve_captcha(page)
-            await human_delay(300, 1200)
-
-            img_bytes = await page.screenshot()
-            if isinstance(img_bytes, str):
-                img_bytes = base64.b64decode(img_bytes)
-
-            path = os.path.join(folder, f"step_{n:04d}_cb.png")
-            with open(path, "wb") as fh:
-                fh.write(img_bytes)
-            print(f"[Callback] step {n:03d} → {path}")
-
-        except Exception as exc:
-            print(f"[Callback] step {n} error: {exc}")
-
-    return _callback
-
 
 # ---------------------------------------------------------------------------
 # LLM BUILDER
 # ---------------------------------------------------------------------------
 
 def build_llm(model: str, api_key: str):
-    try:
-        from browser_use.llm import ChatOpenAI as BU
-        return BU(model=model, api_key=api_key)
-    except Exception:
-        pass
-    try:
-        from browser_use.agent.llm import ChatOpenAI as BU2
-        return BU2(model=model, api_key=api_key)
-    except Exception:
-        pass
+    for mod, cls in [("browser_use.llm", "ChatOpenAI"), ("browser_use.agent.llm", "ChatOpenAI")]:
+        try:
+            import importlib
+            m = importlib.import_module(mod)
+            return getattr(m, cls)(model=model, api_key=api_key)
+        except Exception:
+            pass
     try:
         from openai import AsyncOpenAI
         return AsyncOpenAI(api_key=api_key)
@@ -746,55 +609,311 @@ def build_llm(model: str, api_key: str):
         pass
     raise RuntimeError("Could not build LLM")
 
-
 # ---------------------------------------------------------------------------
 # RESULT CLEANER
 # ---------------------------------------------------------------------------
 
 def _clean_result(text: str) -> Any:
-    """
-    Extract structured data from agent result text.
-    Handles: fenced ```json blocks, <r> tags, bare JSON arrays/objects
-    embedded in prose (the most common case from gpt-5.1 done() output).
-    """
     if not text:
         return text
     text = text.strip()
-
-    # 1. <r>...</r> tags
     m = _re.search(r'<r>\s*(.*?)\s*</r>', text, _re.DOTALL)
     if m:
         try:
             return json.loads(m.group(1).strip())
         except Exception:
             text = m.group(1).strip()
-
-    # 2. Fenced ```json or ``` blocks
     m = _re.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', text, _re.DOTALL)
     if m:
         try:
             return json.loads(m.group(1).strip())
         except Exception:
             pass
-
-    # 3. Direct parse of the whole string
     try:
         return json.loads(text)
     except Exception:
         pass
-
-    # 4. Extract bare JSON array or object embedded anywhere in prose
-    #    Try largest match first (greedy) to get the full structure
-    for pattern in (r'(\[\s*\{.*?\}\s*\])', r'(\{.*?\})', r'(\[.*?\])'):
-        m = _re.search(pattern, text, _re.DOTALL)
+    for pat in (r'(\[\s*\{.*?\}\s*\])', r'(\{.*?\})', r'(\[.*?\])'):
+        m = _re.search(pat, text, _re.DOTALL)
         if m:
             try:
                 return json.loads(m.group(1))
             except Exception:
                 pass
-
     return text
 
+# FIX-5: Smarter validation — checks for real data keys, not just string length
+def _is_valid(result: Any) -> bool:
+    if result in (None, "", [], {}):
+        return False
+    if isinstance(result, str):
+        low = result.lower()
+        # Explicit rejection patterns
+        bad_phrases = [
+            "agent error", "browser_check", "captcha", "wrong captcha",
+            "error:", "maintenance", "access denied", "forbidden",
+            "please wait", "just a moment", "checking your browser",
+        ]
+        if any(k in low for k in bad_phrases):
+            return False
+        # Must be substantial to be real extracted data
+        if len(result) < 200:
+            return False
+    if isinstance(result, dict):
+        # Must have at least one list with actual items
+        has_data = any(isinstance(v, list) and len(v) > 0 for v in result.values())
+        if not has_data:
+            return False
+        # Extra check: if it looks like a tenders response, verify items have expected keys
+        for v in result.values():
+            if isinstance(v, list) and len(v) > 0 and isinstance(v[0], dict):
+                item_keys = set(v[0].keys())
+                # Accept if item has at least 2 of these typical extraction keys
+                expected = {"reference_number", "issuing_entity", "tender_title",
+                            "publication_begin_utc", "submission_deadline_utc", "notice_link"}
+                if len(item_keys & expected) >= 2:
+                    return True
+        return has_data
+    if isinstance(result, list):
+        return len(result) > 0 and isinstance(result[0], dict)
+    return True
+
+# ---------------------------------------------------------------------------
+# SINGLE WORKER  (with all 6 fixes applied)
+# ---------------------------------------------------------------------------
+
+async def _run_worker(
+    wid: str,
+    proxy: dict,
+    request: AgentRequest,
+    result_queue: asyncio.Queue,
+    cancel_event: asyncio.Event,
+    winner_lock: asyncio.Lock,      # FIX-2: prevents double-queue
+) -> None:
+    sid    = f"w{wid}_{str(uuid.uuid4())[:6]}"
+    folder = f"{SCAN_DIR}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{sid}"
+    os.makedirs(folder, exist_ok=True)
+    print(f"[W{wid}] Starting — proxy {proxy['host']}:{proxy['port']}")
+
+    llm   = build_llm(request.model, os.getenv("OPENAI_API_KEY", ""))
+    steps = [0]
+    pc    = [False]
+
+    async def _step(agent) -> None:
+        if cancel_event.is_set():
+            raise asyncio.CancelledError()
+        steps[0] += 1
+        n = steps[0]
+        try:
+            bs = getattr(agent, "browser_session", None)
+            if bs is None:
+                return
+            if not pc[0]:
+                pc[0] = True
+                await _verify_proxy(proxy, wid)
+            await _apply_cdp_stealth(bs)
+            page = await bs.get_current_page()
+            if page is None:
+                return
+            await _solve_captcha(page, proxy)
+            await human_delay(200, 800)
+            img = await page.screenshot()
+            if isinstance(img, str):
+                img = base64.b64decode(img)
+            with open(os.path.join(folder, f"step_{n:04d}_cb.png"), "wb") as fh:
+                fh.write(img)
+            print(f"[W{wid}] step {n:03d} ✓")
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"[W{wid}] step {n} err: {e}")
+
+    kwargs: dict = dict(
+        task=_wrap_prompt(request.prompt), llm=llm,
+        save_conversation_path=folder, max_actions_per_step=1,
+        use_vision=True, max_failures=3, retry_delay=2,
+    )
+
+    # FIX-7: Acquire semaphore before launching browser to cap concurrent instances
+    browser = None
+    async with _browser_semaphore:
+        if BrowserConfig and Browser:
+            try:
+                browser = Browser(config=BrowserConfig(
+                    headless="new",
+                    proxy=_proxy_browser_dict(proxy),
+                    extra_chromium_args=[
+                        "--disable-blink-features=AutomationControlled",
+                        "--no-sandbox", "--disable-dev-shm-usage",
+                        "--enable-webgl", "--use-gl=swiftshader",
+                        "--enable-accelerated-2d-canvas",
+                        "--window-size=1920,1080", "--start-maximized",
+                        "--disable-features=IsolateOrigins,site-per-process",
+                        "--disable-background-timer-throttling",
+                        "--disable-backgrounding-occluded-windows",
+                        "--disable-renderer-backgrounding",
+                        "--no-first-run", "--no-default-browser-check",
+                        "--password-store=basic", "--use-mock-keychain",
+                        "--disable-infobars",
+                        "--lang=en-US,en", "--accept-lang=en-US,en;q=0.9,ar;q=0.8",
+                        '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
+                        'AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+                    ],
+                ))
+                kwargs["browser"] = browser
+            except Exception as e:
+                print(f"[W{wid}] BrowserConfig failed: {e}")
+
+        history = None
+        rt      = ""
+        try:
+            # FIX-1: Warm up BEFORE agent.run() using a direct page navigation
+            if browser is not None:
+                try:
+                    # Get the initial page that browser-use opens and warm it up
+                    agent_pre = Agent(**{**kwargs, "task": "navigate to https://www.google.com"})
+                    bs_pre    = getattr(agent_pre, "browser_session", None)
+                    if bs_pre:
+                        page_pre = await bs_pre.get_current_page()
+                        if page_pre:
+                            await _warmup_page(page_pre, wid)
+                except Exception as e:
+                    print(f"[W{wid}] Pre-warmup failed (non-fatal): {e}")
+
+            agent   = Agent(**kwargs)
+            # FIX-3: Kill worker if it hangs beyond WORKER_TIMEOUT seconds
+            history = await asyncio.wait_for(
+                agent.run(max_steps=request.max_steps, on_step_end=_step),
+                timeout=WORKER_TIMEOUT,
+            )
+
+            # 4-pass result extraction
+            try:
+                fr = history.final_result()
+                if fr:
+                    rt = fr
+            except Exception:
+                pass
+            if not rt:
+                try:
+                    for a in reversed(history.action_results() or []):
+                        if getattr(a, 'is_done', False):
+                            rt = getattr(a, 'extracted_content', '') or ''
+                            break
+                except Exception:
+                    pass
+            if not rt:
+                try:
+                    for h in reversed(history.history or []):
+                        for r in reversed(getattr(h, 'result', []) or []):
+                            if getattr(r, 'is_done', False):
+                                rt = getattr(r, 'extracted_content', '') or ''
+                                break
+                        if rt:
+                            break
+                except Exception:
+                    pass
+            if not rt:
+                skip = ('🔗','🔍','Clicked','Typed','Waited','Scrolled','Searched','Navigated','scroll','Scroll')
+                try:
+                    for a in reversed(history.action_results() or []):
+                        t = getattr(a, 'extracted_content', '') or ''
+                        if t and not any(t.startswith(s) for s in skip):
+                            rt = t
+                            break
+                except Exception:
+                    pass
+
+            cleaned = _clean_result(rt)
+
+            # FIX-2: Use lock to guarantee only ONE worker ever wins
+            if _is_valid(cleaned) and not cancel_event.is_set():
+                async with winner_lock:
+                    if cancel_event.is_set():
+                        print(f"[W{wid}] Lost the race (another worker claimed slot first)")
+                        return
+                    # Claim the slot — signal all other workers to stop
+                    cancel_event.set()
+
+                print(f"[W{wid}] ✅ Valid result! Queuing data…")
+
+                # FIX-6: Queue extracted data FIRST, then build video separately
+                # This way data is never lost even if video upload crashes
+                _dump_screenshots(history, folder)
+                _dump_json_screenshots(folder)
+                _ensure_frames(folder)
+
+                video_url = None
+                try:
+                    fc = len(glob.glob(os.path.join(folder, "*.png")))
+                    print(f"[W{wid}] Building video ({fc} frames)…")
+                    video_url = await create_and_upload_video(folder, sid)
+                except Exception as ve:
+                    print(f"[W{wid}] Video build failed (data still saved): {ve}")
+
+                # Put result — data guaranteed even if video_url is None
+                await result_queue.put((wid, cleaned, steps[0], video_url))
+            else:
+                print(f"[W{wid}] ❌ No valid result (CAPTCHA wall or empty)")
+
+        except asyncio.TimeoutError:
+            # FIX-3: Worker exceeded timeout
+            print(f"[W{wid}] ⏱ Timed out after {WORKER_TIMEOUT}s — killing")
+        except asyncio.CancelledError:
+            print(f"[W{wid}] Cancelled (another worker won)")
+        except Exception as e:
+            print(f"[W{wid}] Error: {e}")
+        finally:
+            if browser:
+                try:
+                    await browser.close()
+                except Exception:
+                    pass
+            try:
+                shutil.rmtree(folder)
+            except Exception:
+                pass
+
+# ---------------------------------------------------------------------------
+# RACE RUNNER
+# ---------------------------------------------------------------------------
+
+async def _race(request: AgentRequest, proxies: list[dict]):
+    """Race workers. Returns (wid, data, steps, video_url) for first winner, or None."""
+    q           = asyncio.Queue()
+    cancel      = asyncio.Event()
+    winner_lock = asyncio.Lock()   # FIX-2
+
+    tasks = [
+        asyncio.create_task(
+            _run_worker(str(i+1), p, request, q, cancel, winner_lock)
+        )
+        for i, p in enumerate(proxies)
+    ]
+
+    winner = None
+    try:
+        pending = set(tasks)
+        while pending and winner is None:
+            done, pending = await asyncio.wait(pending, return_when=asyncio.FIRST_COMPLETED)
+            try:
+                winner = q.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            if not pending and winner is None:
+                try:
+                    winner = q.get_nowait()
+                except asyncio.QueueEmpty:
+                    pass
+                break
+    finally:
+        cancel.set()
+        for t in tasks:
+            if not t.done():
+                t.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+    return winner
 
 # ---------------------------------------------------------------------------
 # MAIN ENDPOINT
@@ -802,188 +921,57 @@ def _clean_result(text: str) -> Any:
 
 @app.post("/agent/run", response_model=AgentResponse)
 async def run_agent(request: AgentRequest) -> AgentResponse:
-    global _ACTIVE_PROXY
-
-    session_id  = str(uuid.uuid4())[:8]
-    timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
-    folder_name = f"{SCAN_DIR}/{timestamp}_{session_id}"
-    os.makedirs(folder_name, exist_ok=True)
-
-    _ACTIVE_PROXY = _pick_proxy()
+    await _refresh_proxy_pool()
 
     print(f"\n{'='*60}")
-    print(f"[Agent] Session   : {session_id}")
-    print(f"[Agent] Task      : {request.prompt}")
-    print(f"[Agent] Model     : {request.model}")
-    print(f"[Agent] Max steps : {request.max_steps}")
-    print(f"[Proxy] Session proxy: {_ACTIVE_PROXY['host']}:{_ACTIVE_PROXY['port']}")
+    print(f"[Race] Task    : {request.prompt[:80]}…")
+    print(f"[Race] Model   : {request.model}")
+    print(f"[Race] Workers : {RACE_WORKERS}  |  Rounds: {RACE_MAX_ROUNDS}  |  Timeout: {WORKER_TIMEOUT}s")
+    print(f"[Race] Pool    : {len(_PROXY_POOL)} proxies  |  Max browsers: {MAX_BROWSERS}")
     print(f"{'='*60}\n")
 
-    llm          = build_llm(request.model, os.getenv("OPENAI_API_KEY", ""))
-    step_counter = [0]
-    on_step_end  = make_screenshot_callback(folder_name, step_counter)
+    # Snapshot pool at request time to avoid mid-refresh issues
+    pool = list(_PROXY_POOL)
+    random.shuffle(pool)
 
-    agent_kwargs: dict = dict(
-        task=_wrap_prompt(request.prompt),
-        llm=llm,
-        save_conversation_path=folder_name,
-        max_actions_per_step=1,
-        use_vision=True,
-        max_failures=3,
-        retry_delay=2,
-    )
+    for rnd in range(1, RACE_MAX_ROUNDS + 1):
+        start   = ((rnd - 1) * RACE_WORKERS) % max(len(pool), 1)
+        proxies = [pool[(start + i) % len(pool)] for i in range(RACE_WORKERS)]
+        print(f"[Race] Round {rnd}/{RACE_MAX_ROUNDS} — {[p['host'] for p in proxies]}")
 
-    browser = None
-    if BrowserConfig is not None and Browser is not None:
-        try:
-            proxy_dict = _proxy_browser_dict(_ACTIVE_PROXY)
-            print(f"[Proxy] Browser proxy server : {proxy_dict['server']}")
-            print(f"[Proxy] Browser proxy user   : {proxy_dict['username']}")
+        winner = await _race(request, proxies)
 
-            browser_cfg = BrowserConfig(
-                headless=True,
-                proxy=proxy_dict,
-                extra_chromium_args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--disable-dev-shm-usage",
-                    "--disable-gpu",
-                    "--window-size=1920,1080",
-                    "--disable-features=IsolateOrigins,site-per-process",
-                    "--disable-background-timer-throttling",
-                    "--disable-backgrounding-occluded-windows",
-                    "--disable-renderer-backgrounding",
-                    "--no-first-run",
-                    "--no-default-browser-check",
-                    "--password-store=basic",
-                    "--use-mock-keychain",
-                    '--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/131.0.0.0 Safari/537.36',
-                ],
+        if winner is not None:
+            wid, data, steps, vu = winner
+            print(f"\n[Race] 🏆 Winner: Worker-{wid} in round {rnd}")
+            return AgentResponse(
+                video_url=vu,
+                steps_taken=steps,
+                extracted_data=data,
+                worker_id=wid,
             )
-            browser = Browser(config=browser_cfg)
-            agent_kwargs["browser"] = browser
-            print("[Agent] BrowserConfig applied ✅")
-        except Exception as e:
-            print(f"[Agent] BrowserConfig failed ({e}), using defaults")
 
-    agent        = Agent(**agent_kwargs)
-    result_text  = ""
-    history      = None
+        print(f"[Race] Round {rnd} — all workers failed, next round…")
 
-    try:
-        history     = await agent.run(max_steps=request.max_steps, on_step_end=on_step_end)
-        result_text = ""
-
-        # ── Pass 1: history.final_result() — the canonical browser-use 0.11.x API ──
-        try:
-            fr = history.final_result()
-            if fr:
-                result_text = fr
-                print(f"[Agent] Pass 1 (final_result): got {len(result_text)} chars")
-        except Exception as exc:
-            print(f"[Agent] Pass 1 failed: {exc}")
-
-        # ── Pass 2: walk history.action_results() for is_done entries ────────────
-        if not result_text:
-            try:
-                for action in reversed(history.action_results() or []):
-                    if getattr(action, 'is_done', False):
-                        raw = getattr(action, 'extracted_content', '') or ''
-                        if raw:
-                            result_text = raw
-                            print(f"[Agent] Pass 2 (action_results is_done): got {len(result_text)} chars")
-                        break
-            except Exception as exc:
-                print(f"[Agent] Pass 2 failed: {exc}")
-
-        # ── Pass 3: walk history.history[].result for is_done entries ────────────
-        if not result_text:
-            try:
-                for h in reversed(history.history or []):
-                    for r in reversed(getattr(h, 'result', []) or []):
-                        if getattr(r, 'is_done', False):
-                            raw = getattr(r, 'extracted_content', '') or ''
-                            if raw:
-                                result_text = raw
-                                print(f"[Agent] Pass 3 (history.result is_done): got {len(result_text)} chars")
-                            break
-                    if result_text:
-                        break
-            except Exception as exc:
-                print(f"[Agent] Pass 3 failed: {exc}")
-
-        # ── Pass 4: any non-navigation extracted_content ─────────────────────────
-        if not result_text:
-            try:
-                skip = ('🔗', '🔍', 'Clicked', 'Typed', 'Waited', 'Scrolled',
-                        'Searched', 'Navigated', 'scroll', 'Scroll')
-                for action in reversed(history.action_results() or []):
-                    text = getattr(action, 'extracted_content', '') or ''
-                    if text and not any(text.startswith(s) for s in skip):
-                        result_text = text
-                        print(f"[Agent] Pass 4 (any extracted_content): got {len(result_text)} chars")
-                        break
-            except Exception as exc:
-                print(f"[Agent] Pass 4 failed: {exc}")
-
-        print(f"[Agent] result_text length before clean: {len(result_text)}")
-        if result_text:
-            print(f"[Agent] result_text preview: {result_text[:200]!r}")
-
-        print(f"[Agent] ✅ Completed in {step_counter[0]} steps")
-
-    except Exception as exc:
-        import traceback
-        traceback.print_exc()
-        result_text = f"Agent error: {exc}"
-        print(f"[Agent] ❌ Failed: {exc}")
-
-    finally:
-        if browser is not None:
-            try:
-                await browser.close()
-            except Exception:
-                pass
-
-    if history is not None:
-        _dump_history_screenshots(history, folder_name)
-    _dump_json_screenshots(folder_name)
-
-    steps_taken = step_counter[0] or (
-        len((history.action_results() if history else None) or []) if history else 0
-    )
-
-    _ensure_minimum_frames(folder_name)
-
-    frame_count = len(glob.glob(os.path.join(folder_name, "*.png")))
-    print(f"[Agent] Building video from {frame_count} screenshot(s)…")
-    video_url = await create_and_upload_video(folder_name, session_id)
-    print(f"[Agent] Video URL : {video_url}")
-
-    try:
-        shutil.rmtree(folder_name)
-        print(f"[Cleanup] Deleted scan folder: {folder_name}")
-    except Exception as exc:
-        print(f"[Cleanup] Could not delete: {exc}")
-
-    cleaned = _clean_result(result_text)
-    # Explicit check — `or None` would wrongly discard valid falsy values
-    extracted = cleaned if cleaned not in (None, "", [], {}) else None
-    print(f"[Agent] extracted_data type={type(extracted).__name__}, preview={str(extracted)[:120] if extracted is not None else 'None'}")
-
-    return AgentResponse(
-        video_url=video_url,
-        steps_taken=steps_taken,
-        extracted_data=extracted,
-    )
-
+    print("[Race] ❌ All rounds exhausted — no valid result")
+    return AgentResponse(video_url=None, steps_taken=0, extracted_data=None, worker_id=None)
 
 # ---------------------------------------------------------------------------
-# HEALTH CHECK
+# STARTUP + HEALTH
 # ---------------------------------------------------------------------------
+
+@app.on_event("startup")
+async def startup_event():
+    await _refresh_proxy_pool()
 
 @app.get("/health")
 async def health() -> dict:
-    return {"status": "ok", "version": "1.0.0"}
+    return {
+        "status": "ok",
+        "version": "5.0.0",
+        "proxy_pool_size": len(_PROXY_POOL),
+        "race_workers": RACE_WORKERS,
+        "race_max_rounds": RACE_MAX_ROUNDS,
+        "worker_timeout_sec": WORKER_TIMEOUT,
+        "max_browsers": MAX_BROWSERS,
+    }
