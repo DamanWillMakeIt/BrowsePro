@@ -5,6 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1
 
 WORKDIR /app
 
+# Install system dependencies (including Firefox deps for Camoufox)
 RUN apt-get update && apt-get install -y --no-install-recommends \
     ffmpeg \
     libnss3 \
@@ -29,12 +30,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates \
     && rm -rf /var/lib/apt/lists/*
 
+# Install Python packages
 COPY requirements.txt .
-
 RUN pip install --no-cache-dir -r requirements.txt
 
-RUN playwright install chromium
+# Install browsers (Camoufox + Chromium fallback)
+RUN python -m camoufox fetch && \
+    playwright install chromium
 
+# Copy application code
 COPY . .
 
 EXPOSE 8000
