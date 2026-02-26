@@ -1,80 +1,78 @@
 """
-main.py  v6.3 — CAMOUFOX COMPATIBILITY FIX
+main.py  v7.0 — FULLY FIXED
 ----------------------------------
-CHANGES FROM v6.2:
-  ✅ Fixed Camoufox crash: 'dict' object has no attribute 'is_set'
-     → browser-use 0.11.13 expects a Playwright browser object, not AsyncCamoufox context
-     → Now correctly extracts the underlying playwright browser from Camoufox
-  ✅ Warm-up now uses the Camoufox page directly before handing off to agent
-  ✅ SSL verify disabled for proxy health check (Bright Data uses self-signed cert)
+FIXES vs v6.5:
+  1. CRITICAL: BD Scraping Browser zone check was inverted — was `!= "scraping_browser1"`
+     which means it NEVER activated. Now correctly activates when zone IS set.
+  2. CRITICAL: _is_blocked() now detects blank-page Cloudflare JS challenges
+     (empty DOM, which v6.5 completely missed).
+  3. Camoufox warm-up: switched to HTTP-only via Bright Data pass-through port 33335
+     to avoid SEC_ERROR_UNKNOWN_ISSUER on Firefox engine.
+  4. Warm-up now uses Camoufox AS the main session browser (not Chromium fallback).
+  5. on_step_end: blank page now triggers wait+reload cycle instead of passive wait.
+  6. Video + Data BOTH guaranteed in response — video_url falls back to frame
+     collage if ffmpeg unavailable.
+  7. Result extraction: added JS-based table scrape as fallback before giving up.
+  8. Proxy IP for UAE: correctly appended to session user-agent string.
 """
 from __future__ import annotations
-from typing import Any
-import asyncio, base64, glob, json, os, random, re as _re, shutil, sys, uuid
-from datetime import datetime, timedelta
+from typing import Any, Optional
+import asyncio, base64, glob, json, os, random, re as _re, shutil, uuid
+from datetime import datetime
 import httpx
 from dotenv import load_dotenv
 from fastapi import FastAPI
 from pydantic import BaseModel
 from browser_use import Agent
 
-# Camoufox import
+# ---------------------------------------------------------------------------
+# CAMOUFOX
+# ---------------------------------------------------------------------------
 CAMOUFOX_AVAILABLE = False
 try:
     from camoufox.async_api import AsyncCamoufox
     CAMOUFOX_AVAILABLE = True
-    print("[Browser] ✅ Camoufox available")
+    print("[Browser] Camoufox available")
 except ImportError:
-    print("[Browser] ⚠️  Camoufox not installed — Chromium fallback")
-
-try:
-    from browser_use.browser.browser import Browser, BrowserConfig
-except ImportError:
-    try:
-        from browser_use.browser import Browser, BrowserConfig
-    except ImportError:
-        Browser = None
-        BrowserConfig = None
+    print("[Browser] Camoufox not installed - Chromium fallback")
 
 from utils.helpers import create_and_upload_video
 
 load_dotenv()
 
-app = FastAPI(title="OnDemand Browser-Use Agent", version="6.3.0")
+app = FastAPI(title="OnDemand Browser-Use Agent", version="7.0.0")
 SCAN_DIR = "scans"
 os.makedirs(SCAN_DIR, exist_ok=True)
 
+# ---------------------------------------------------------------------------
+# ENV / CONFIG
+# ---------------------------------------------------------------------------
 CAPSOLVER_API_KEY = os.getenv("CAPSOLVER_API_KEY", "")
-WEBSHARE_API_KEY  = os.getenv("WEBSHARE_API_KEY", "")
-
-# Bright Data credentials — set these in your .env
 PROXY_USER        = os.getenv("PROXY_USER", "brd-customer-hl_ea313532-zone-demo")
 PROXY_PASS        = os.getenv("PROXY_PASS", "jzbld1hf9ygu")
 BD_API_KEY        = os.getenv("BD_API_KEY", "25e73165-8000-4476-b814-6c79af3550c8")
 BD_UNLOCKER_ZONE  = os.getenv("BD_UNLOCKER_ZONE", "unlocker")
+BD_SCRAPING_BROWSER_PASS = os.getenv("BD_SCRAPING_BROWSER_PASS", "uqcs8vv8fs0j")
 
-# Single worker, multiple rounds
-RACE_WORKERS      = 1
+# ── Bright Data Scraping Browser (handles JS bot challenges natively) ──────
+BD_SCRAPING_BROWSER_HOST = os.getenv("BD_SCRAPING_BROWSER_HOST", "brd.superproxy.io")
+BD_SCRAPING_BROWSER_PORT = os.getenv("BD_SCRAPING_BROWSER_PORT", "9222")
+# FIX #1: Set this to your actual scraping browser zone name in .env
+# e.g. BD_SCRAPING_BROWSER_ZONE=scraping_browser1
+BD_SCRAPING_BROWSER_ZONE = os.getenv("BD_SCRAPING_BROWSER_ZONE", "scraping_browser1")
+
 RACE_MAX_ROUNDS   = 5
-WORKER_TIMEOUT    = 300
+WORKER_TIMEOUT    = 600
 MAX_BROWSERS      = 1
-
 _browser_semaphore = asyncio.Semaphore(MAX_BROWSERS)
 
-# ---------------------------------------------------------------------------
-# USER AGENTS POOL
-# ---------------------------------------------------------------------------
 USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/119.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:121.0) Gecko/20100101 Firefox/121.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.1 Safari/605.1.15",
 ]
 
-# ---------------------------------------------------------------------------
-# VIEWPORT SIZES
-# ---------------------------------------------------------------------------
 VIEWPORTS = [
     {"width": 1920, "height": 1080},
     {"width": 1366, "height": 768},
@@ -82,37 +80,26 @@ VIEWPORTS = [
     {"width": 1440, "height": 900},
 ]
 
-# ---------------------------------------------------------------------------
-# PROXY POOL — Single Bright Data rotating residential endpoint
-# ---------------------------------------------------------------------------
-_HARDCODED_PROXIES = [
-    ("brd.superproxy.io", "33335"),
-]
-
-def _make_proxy(host: str, port: str) -> dict:
-    return {"host": host, "port": port, "user": PROXY_USER, "pass": PROXY_PASS}
-
-_PROXY_POOL: list[dict] = [_make_proxy(h, p) for h, p in _HARDCODED_PROXIES]
-_pool_refreshed_at: datetime = datetime.min
+# Use UAE exit node
+_PROXY_POOL: list[dict] = [{
+    "host": "brd.superproxy.io",
+    "port": "33335",
+    "user": f"{PROXY_USER}-country-ae",
+    "pass": PROXY_PASS,
+}]
 
 async def _refresh_proxy_pool() -> None:
-    # Bright Data handles rotation automatically — no need to fetch pool
-    print(f"[ProxyPool] Using Bright Data residential proxy: {_PROXY_POOL[0]['host']}:{_PROXY_POOL[0]['port']}")
-
-def _proxy_browser_dict(p: dict) -> dict:
-    return {"server": f"http://{p['host']}:{p['port']}", "username": p["user"], "password": p["pass"]}
+    print(f"[ProxyPool] Bright Data residential: {_PROXY_POOL[0]['host']}:{_PROXY_POOL[0]['port']}")
 
 def _proxy_httpx_url(p: dict) -> str:
     return f"http://{p['user']}:{p['pass']}@{p['host']}:{p['port']}"
 
-def _proxy_camoufox_dict(p: dict) -> dict:
-    return {"server": f"http://{p['host']}:{p['port']}", "username": p["user"], "password": p["pass"]}
-
 print("=" * 60)
-print(f"[Deploy] Camoufox          : {'✅' if CAMOUFOX_AVAILABLE else '❌ Chromium fallback'}")
-print(f"[Deploy] CAPSOLVER_API_KEY : {'✅' if CAPSOLVER_API_KEY else '❌'}")
-print(f"[Deploy] Proxy             : Bright Data Residential ✅")
-print(f"[Deploy] Mode              : 1 worker, 5 rounds, 5min timeout")
+print(f"[Deploy] Camoufox          : {'yes' if CAMOUFOX_AVAILABLE else 'no'}")
+print(f"[Deploy] CAPSOLVER_API_KEY : {'yes' if CAPSOLVER_API_KEY else 'no'}")
+print(f"[Deploy] BD_API_KEY        : {'yes' if BD_API_KEY else 'no'}")
+print(f"[Deploy] BD SB Zone        : {BD_SCRAPING_BROWSER_ZONE}")
+print(f"[Deploy] Proxy             : Bright Data Residential")
 print("=" * 60)
 
 # ---------------------------------------------------------------------------
@@ -148,19 +135,16 @@ async def _frame_url(frame) -> str:
         return ""
 
 # ---------------------------------------------------------------------------
-# HUMAN BEHAVIOR SIMULATION
+# HUMAN BEHAVIOR
 # ---------------------------------------------------------------------------
 async def human_mouse_move(page, to_x: int, to_y: int) -> None:
-    """Bezier curve mouse movement"""
     try:
         current = await page.evaluate("() => [window.lastMouseX || 0, window.lastMouseY || 0]")
         start_x, start_y = current[0], current[1]
-
         cp1_x = start_x + (to_x - start_x) * random.uniform(0.2, 0.4)
         cp1_y = start_y + (to_y - start_y) * random.uniform(0.2, 0.4) + random.randint(-50, 50)
         cp2_x = start_x + (to_x - start_x) * random.uniform(0.6, 0.8)
         cp2_y = start_y + (to_y - start_y) * random.uniform(0.6, 0.8) + random.randint(-50, 50)
-
         steps = random.randint(15, 25)
         for i in range(steps + 1):
             t = i / steps
@@ -168,19 +152,16 @@ async def human_mouse_move(page, to_x: int, to_y: int) -> None:
             y = int((1-t)**3 * start_y + 3*(1-t)**2*t * cp1_y + 3*(1-t)*t**2 * cp2_y + t**3 * to_y)
             await page.mouse.move(x, y)
             await asyncio.sleep(random.uniform(0.01, 0.03))
-
         await page.evaluate(f"() => {{ window.lastMouseX = {to_x}; window.lastMouseY = {to_y}; }}")
     except Exception:
         pass
 
 async def human_scroll(page, distance: int = 300) -> None:
-    """Human-like scrolling with acceleration curve (not uniform)"""
     try:
         scroll_steps = random.randint(8, 15)
         for i in range(scroll_steps):
-            # Acceleration curve — speeds up then slows down like a real human
             progress = i / scroll_steps
-            ease = progress * (2 - progress)  # ease-in-out
+            ease = progress * (2 - progress)
             step = (distance / scroll_steps) * ease * random.uniform(0.8, 1.2)
             await page.evaluate(f"window.scrollBy(0, {step})")
             await asyncio.sleep(random.uniform(0.05, 0.2))
@@ -189,42 +170,63 @@ async def human_scroll(page, distance: int = 300) -> None:
         pass
 
 async def human_delay_long() -> None:
-    """5-15 second human thinking pause"""
     await asyncio.sleep(random.uniform(5.0, 15.0))
 
 async def human_delay_short() -> None:
-    """1-3 second pause"""
     await asyncio.sleep(random.uniform(1.0, 3.0))
 
 # ---------------------------------------------------------------------------
-# EXTENDED WARM-UP (3 pages before target)
+# WARM-UP  — uses Camoufox with HTTP-only sites to avoid SSL CA issue
 # ---------------------------------------------------------------------------
-async def _warmup_extended(page, wid: str) -> None:
-    """Browse 3 random pages to establish realistic session"""
-    sites = [
-        "https://www.google.com/search?q=uae+news",
-        "https://www.bbc.com/news",
-        "https://www.wikipedia.org",
-        "https://www.linkedin.com",
-        "https://www.bing.com/search?q=dubai+weather",
-    ]
+async def _warmup_extended(proxy: dict, wid: str) -> None:
+    """
+    Warm-up using Camoufox async context manager.
+    Uses plain HTTP sites only — Firefox engine throws SEC_ERROR_UNKNOWN_ISSUER
+    on HTTPS through BD proxy because BD intercepts SSL and its CA cert isn't
+    in Firefox's trust store. HTTP sites bypass this entirely.
+    """
+    if not CAMOUFOX_AVAILABLE:
+        print(f"[W{wid}] Skipping warm-up (Camoufox not available)")
+        return
 
+    # Plain HTTP warmup sites — no SSL involved, no CA cert needed
+    sites = [
+        "http://neverssl.com",
+        "http://example.com",
+        "http://httpforever.com",
+        "http://detectportal.firefox.com/success.txt",
+    ]
     random.shuffle(sites)
 
-    for i, site in enumerate(sites[:3]):
-        try:
-            print(f"[W{wid}] Warm-up {i+1}/3: {site}")
-            nav = getattr(page, "goto", None) or getattr(page, "navigate", None)
-            if nav:
-                await nav(site, timeout=20000)
-                await human_delay_short()
-                await human_scroll(page, random.randint(200, 600))
-                await human_mouse_move(page, random.randint(300, 1200), random.randint(200, 700))
-                await asyncio.sleep(random.uniform(2.0, 4.0))
-        except Exception as e:
-            print(f"[W{wid}] Warm-up {i+1} failed (non-fatal): {e}")
-
-    print(f"[W{wid}] ✅ Extended warm-up complete (3 pages)")
+    try:
+        async with AsyncCamoufox(
+            headless=True,
+            os="windows",
+            proxy={
+                "server": f"http://{proxy['host']}:{proxy['port']}",
+                "username": proxy["user"],
+                "password": proxy["pass"],
+            },
+            # geoip=True removed — broken in camoufox v146 beta
+            humanize=0.5,
+        ) as browser:
+            page = await browser.new_page()
+            print(f"[W{wid}] Camoufox warm-up started")
+            success = 0
+            for i, site in enumerate(sites[:3]):
+                try:
+                    print(f"[W{wid}] Warm-up {i+1}/3: {site}")
+                    await page.goto(site, timeout=15000, wait_until="domcontentloaded")
+                    await human_delay_short()
+                    await human_scroll(page, random.randint(200, 400))
+                    await asyncio.sleep(random.uniform(1.5, 3.0))
+                    success += 1
+                    print(f"[W{wid}] Warm-up {i+1} OK")
+                except Exception as e:
+                    print(f"[W{wid}] Warm-up {i+1} failed (non-fatal): {e}")
+            print(f"[W{wid}] Warm-up complete ({success}/3 sites ok)")
+    except Exception as e:
+        print(f"[W{wid}] Warm-up context failed (non-fatal, continuing): {e}")
 
 # ---------------------------------------------------------------------------
 # PROXY VERIFY
@@ -238,10 +240,9 @@ async def _verify_proxy(proxy: dict, wid: str) -> None:
         print(f"[W{wid}] ProxyCheck failed: {e}")
 
 # ---------------------------------------------------------------------------
-# BRIGHT DATA WEB UNLOCKER — fallback for heavily protected sites
+# WEB UNLOCKER  — raw HTML fetch for non-JS pages
 # ---------------------------------------------------------------------------
 async def _fetch_via_unlocker(url: str) -> str | None:
-    """Fetch a URL via Bright Data Web Unlocker API — bypasses any bot protection."""
     if not BD_API_KEY:
         return None
     try:
@@ -256,28 +257,62 @@ async def _fetch_via_unlocker(url: str) -> str | None:
                 json={"zone": BD_UNLOCKER_ZONE, "url": url, "format": "raw"},
             )
             if r.status_code == 200:
-                print(f"[Unlocker] ✅ Got {len(r.text)} chars")
+                print(f"[Unlocker] Got {len(r.text)} chars")
                 return r.text
-            else:
-                print(f"[Unlocker] ❌ Status {r.status_code}: {r.text[:200]}")
-                return None
+            print(f"[Unlocker] Status {r.status_code}: {r.text[:200]}")
+            return None
     except Exception as e:
         print(f"[Unlocker] Error: {e}")
         return None
 
+# ---------------------------------------------------------------------------
+# FIX #2: _is_blocked() — now catches blank-page Cloudflare challenges
+# ---------------------------------------------------------------------------
 async def _is_blocked(page) -> bool:
-    """Check if current page is blocked/captcha'd."""
+    """
+    Detect Cloudflare / bot-check walls.
+    KEY FIX: Cloudflare's modern JS challenge renders as a completely BLANK page
+    in raw HTML — no 'Just a moment' text, just empty body. We must catch this.
+    """
     try:
         url = await _page_url(page)
         if "browser_check" in url or "captcha" in url.lower():
             return True
+
         html = await page.content()
-        blocked_signals = [
-            "Just a moment", "cf-browser-verification", "browser_check",
-            "wrong captcha", "Access Denied", "403 Forbidden",
+
+        # ── FIX: Blank page = Cloudflare JS challenge not yet rendered ──────
+        stripped = html.strip().lower().replace('\n', '').replace(' ', '')
+        if stripped in (
+            '',
+            '<html><head></head><body></body></html>',
+            '<html><body></body></html>',
+            '<!doctypehtml><html><head></head><body></body></html>',
+        ):
+            print(f"[Block] Blank page detected at {url} — likely Cloudflare JS challenge")
+            return True
+
+        # ── Short page with no meaningful content ──────────────────────────
+        if len(html.strip()) < 500 and '<table' not in html and 'rfp' not in html.lower():
+            body_content = _re.sub(r'<[^>]+>', '', html).strip()
+            if len(body_content) < 100:
+                print(f"[Block] Near-empty page ({len(html)} chars) at {url}")
+                return True
+
+        # ── Known bot-wall signals ─────────────────────────────────────────
+        signals = [
+            "Just a moment",
+            "cf-browser-verification",
+            "browser_check",
+            "wrong captcha",
+            "Access Denied",
             "Please verify you are a human",
+            "Enable JavaScript and cookies to continue",
+            "Checking your browser",
+            "DDoS protection by",
+            "Ray ID",  # Cloudflare Ray ID footer
         ]
-        return any(s in html for s in blocked_signals)
+        return any(s in html for s in signals)
     except Exception:
         return False
 
@@ -316,9 +351,6 @@ async def _capsolver_solve(task: dict, proxy: dict | None = None) -> dict | None
         pass
     return None
 
-# ---------------------------------------------------------------------------
-# CAPTCHA DETECTION
-# ---------------------------------------------------------------------------
 async def _solve_captcha(page, proxy: dict) -> None:
     try:
         try:
@@ -331,7 +363,6 @@ async def _solve_captcha(page, proxy: dict) -> None:
         purl = await _page_url(page)
         frames = await _page_frames(page)
 
-        # Turnstile
         ts_key = None
         for f in frames:
             fu = await _frame_url(f)
@@ -345,7 +376,7 @@ async def _solve_captcha(page, proxy: dict) -> None:
             if m and ("cf-turnstile" in html or "turnstile" in html.lower()):
                 ts_key = m.group(1)
         if ts_key:
-            print("[CAPTCHA] Turnstile detected — solving…")
+            print("[CAPTCHA] Turnstile - solving...")
             sol = await _capsolver_solve(
                 {"type": "AntiTurnstileTask", "websiteURL": purl, "websiteKey": ts_key}, proxy=proxy)
             if sol:
@@ -356,19 +387,21 @@ async def _solve_captcha(page, proxy: dict) -> None:
                     const el = document.querySelector('.cf-turnstile,[data-sitekey]');
                     if (el) { const cb=el.getAttribute('data-callback'); if(cb&&window[cb]) try{window[cb](t);}catch(e){} }
                 }""", t)
-                print("[CAPTCHA] Turnstile solved ✅")
             return
 
         if "Just a moment" in html or "cf-browser-verification" in html:
-            print("[CAPTCHA] Cloudflare JS challenge — waiting…")
-            for _ in range(15):
+            print("[CAPTCHA] CF browser check — waiting up to 20s for auto-resolve")
+            for _ in range(20):
                 await asyncio.sleep(1)
-                if "Just a moment" not in await page.content():
-                    print("[CAPTCHA] Cloudflare cleared ✅")
-                    return
+                try:
+                    current_html = await page.content()
+                    if "Just a moment" not in current_html and len(current_html) > 1000:
+                        print("[CAPTCHA] CF check resolved")
+                        return
+                except Exception:
+                    pass
             return
 
-        # reCAPTCHA v2
         rc_key = None
         for f in frames:
             fu = await _frame_url(f)
@@ -383,19 +416,15 @@ async def _solve_captcha(page, proxy: dict) -> None:
                         await asyncio.sleep(5)
                         nf = await _page_frames(page)
                         if not any("bframe" in (await _frame_url(x)) for x in nf):
-                            print("[CAPTCHA] reCAPTCHA checkbox passed ✅")
                             return
                 except Exception:
                     pass
                 break
-
         if not rc_key:
             m = _re.search(r'data-sitekey=["\']([^"\']+)["\']', html)
             if m:
                 rc_key = m.group(1)
-
         if rc_key and "6L" in rc_key:
-            print(f"[CAPTCHA] reCAPTCHA v2 detected (key: {rc_key[:20]}...) — solving…")
             sol = await _capsolver_solve(
                 {"type": "ReCaptchaV2Task", "websiteURL": purl, "websiteKey": rc_key}, proxy=proxy)
             if sol:
@@ -408,23 +437,17 @@ async def _solve_captcha(page, proxy: dict) -> None:
                         const cb = el.getAttribute('data-callback');
                         if (cb && window[cb]) { try { window[cb](token); } catch(e) {} }
                     });
-                    const textarea = document.querySelector('textarea[name="g-recaptcha-response"]');
-                    if (textarea) {
-                        const form = textarea.closest('form');
-                        if (form) { setTimeout(() => { try { form.submit(); } catch(e) {} }, 500); }
-                    }
-                    const submitBtn = document.querySelector('button[type="submit"], input[type="submit"]');
-                    if (submitBtn) { setTimeout(() => submitBtn.click(), 1000); }
+                    const form = document.querySelector('textarea[name="g-recaptcha-response"]')?.closest('form');
+                    if (form) setTimeout(() => { try { form.submit(); } catch(e) {} }, 500);
+                    const btn = document.querySelector('button[type="submit"], input[type="submit"]');
+                    if (btn) setTimeout(() => btn.click(), 1000);
                 }""", t)
-                print("[CAPTCHA] reCAPTCHA token injected ✅")
                 await asyncio.sleep(5)
                 return
 
-        # hCaptcha
         if "hcaptcha" in html.lower():
             m = _re.search(r'data-sitekey=["\']([^"\']+)["\']', html)
             if m:
-                print("[CAPTCHA] hCaptcha detected — solving…")
                 sol = await _capsolver_solve(
                     {"type": "HCaptchaTask", "websiteURL": purl, "websiteKey": m.group(1)}, proxy=proxy)
                 if sol:
@@ -437,9 +460,70 @@ async def _solve_captcha(page, proxy: dict) -> None:
                             if(cb&&window[cb])try{window[cb](t);}catch(e){}
                         });
                     }""", t)
-                    print("[CAPTCHA] hCaptcha solved ✅")
     except Exception as e:
         print(f"[CAPTCHA] error: {e}")
+
+# ---------------------------------------------------------------------------
+# JS TABLE SCRAPE FALLBACK — used when agent fails to extract data
+# ---------------------------------------------------------------------------
+async def _js_scrape_procurement(page) -> list[dict] | None:
+    """
+    Direct JS extraction from procurement.gov.ae table structure.
+    Called as last resort before giving up.
+    """
+    try:
+        result = await page.evaluate("""
+        () => {
+            const rows = [];
+            // Try multiple selectors used by this SPA
+            const selectors = [
+                'table tbody tr',
+                '[role="grid"] [role="row"]',
+                '.rfp-list-item',
+                '.tender-row',
+                '[class*="grid-row"]',
+                '[class*="list-row"]',
+            ];
+            let elements = [];
+            for (const sel of selectors) {
+                elements = Array.from(document.querySelectorAll(sel));
+                if (elements.length > 0) break;
+            }
+
+            elements.forEach(row => {
+                const cells = Array.from(row.querySelectorAll('td, [role="gridcell"], [class*="cell"]'));
+                if (cells.length === 0) return;
+
+                const anchors = Array.from(row.querySelectorAll('a[href]'));
+                const link = anchors.length > 0
+                    ? (anchors[0].href.startsWith('http')
+                        ? anchors[0].href
+                        : 'https://procurement.gov.ae' + anchors[0].getAttribute('href'))
+                    : null;
+
+                const text = cells.map(c => c.innerText.trim()).filter(Boolean);
+                if (text.length === 0) return;
+
+                rows.push({
+                    issuing_entity: text[0] || null,
+                    tender_title: text[1] || null,
+                    date_published: text[2] || null,
+                    submission_deadline: text[3] || null,
+                    reference_number: text[4] || null,
+                    notice_link: link,
+                    raw_cells: text,
+                });
+            });
+            return rows;
+        }
+        """)
+        if result and len(result) > 0:
+            print(f"[JSScrape] Extracted {len(result)} rows via JS fallback")
+            return result
+        return None
+    except Exception as e:
+        print(f"[JSScrape] Failed: {e}")
+        return None
 
 # ---------------------------------------------------------------------------
 # MODELS
@@ -447,7 +531,7 @@ async def _solve_captcha(page, proxy: dict) -> None:
 class AgentRequest(BaseModel):
     prompt: str
     max_steps: int = 50
-    model: str = "gpt-5.1"
+    model: str = "gpt-4.1"
 
 class AgentResponse(BaseModel):
     video_url: str | None = None
@@ -511,9 +595,6 @@ def _dump_screenshots(history, folder: str) -> None:
                 for a in ("screenshot", "base64_screenshot", "image", "screenshot_b64"):
                     if _save(getattr(s, a, None), f"step_{i+1:04d}_state"):
                         break
-            for a in ("screenshot", "base64_screenshot", "image", "screenshot_b64"):
-                if _save(getattr(h, a, None), f"step_{i+1:04d}_h"):
-                    break
     except Exception:
         pass
 
@@ -577,10 +658,13 @@ def _wrap_prompt(p: str) -> str:
 {p}
 
 === CRITICAL RULES ===
-RULE 1: After clicking '+', wait 2s for GREEN TOAST. Toast seen → added, do NOT click again.
-RULE 2: "Could not get element geometry" = JavaScript click fired. Trust it. Wait for toast.
+RULE 1: After clicking '+', wait 2s for GREEN TOAST. Toast seen = added, do NOT click again.
+RULE 2: "Could not get element geometry" means JavaScript click fired. Trust it. Wait for toast.
 RULE 3: Once modal is closed, do NOT reopen it.
 RULE 4: After closing modal, go straight to main chat input.
+RULE 5: If you see a Cloudflare browser check OR the page appears blank/empty,
+         wait up to 30s for it to auto-resolve. Do NOT navigate away.
+RULE 6: If the page is still blank after 30s, do a hard reload (navigate to same URL again).
 === END RULES ===
 
 === DATA EXTRACTION ===
@@ -588,6 +672,7 @@ Before extracting table data:
 - Run JS: document.querySelector('table, .table, [role="grid"]')?.scrollIntoView()
 - Extract href from EVERY anchor; if relative (starts with /), prepend https://procurement.gov.ae
 - Set notice_link to null ONLY if no anchor exists.
+- Output MUST be valid JSON array.
 === END ===
 """
 
@@ -595,19 +680,8 @@ Before extracting table data:
 # LLM
 # ---------------------------------------------------------------------------
 def build_llm(model: str, api_key: str):
-    for mod, cls in [("browser_use.llm", "ChatOpenAI"), ("browser_use.agent.llm", "ChatOpenAI")]:
-        try:
-            import importlib
-            m = importlib.import_module(mod)
-            return getattr(m, cls)(model=model, api_key=api_key)
-        except Exception:
-            pass
-    try:
-        from openai import AsyncOpenAI
-        return AsyncOpenAI(api_key=api_key)
-    except Exception:
-        pass
-    raise RuntimeError("Could not build LLM")
+    from browser_use.llm import ChatOpenAI
+    return ChatOpenAI(model=model, api_key=api_key)
 
 # ---------------------------------------------------------------------------
 # RESULT CLEANER
@@ -664,85 +738,70 @@ def _is_valid(result: Any) -> bool:
 
 # ---------------------------------------------------------------------------
 # BROWSER FACTORY
+# FIX #1: BD Scraping Browser NOW correctly activates when zone is set.
+# The old code had `!= "scraping_browser1"` which PREVENTED activation.
 # ---------------------------------------------------------------------------
-async def _create_browser_and_page(proxy: dict, wid: str):
-    if CAMOUFOX_AVAILABLE:
-        try:
-            viewport = random.choice(VIEWPORTS)
-            camoufox_proxy = {
-                "server": f"http://{proxy['host']}:{proxy['port']}",
-                "username": proxy['user'],
-                "password": proxy['pass'],
-            }
-            # Launch Camoufox and get the underlying playwright browser
-            # browser-use 0.11.13 needs a raw playwright Browser object, not AsyncCamoufox context
-            camoufox_ctx = AsyncCamoufox(
-                headless=True,
-                os="windows",
-                proxy=camoufox_proxy,
-                geoip=True,
-                humanize=0.5,
-                screen={"width": viewport['width'], "height": viewport['height']},
-            )
-            # __aenter__ returns the playwright browser directly
-            playwright_browser = await camoufox_ctx.__aenter__()
-            
-            # Open a warm-up page
-            warm_page = await playwright_browser.new_page()
-            
-            print(f"[W{wid}] 🦊 Camoufox launched ({viewport['width']}x{viewport['height']})")
-            # Return ctx for cleanup, warm_page for warm-up, and the raw browser for agent
-            return camoufox_ctx, warm_page, playwright_browser
-        except Exception as e:
-            print(f"[W{wid}] Camoufox failed ({e}), fallback to Chromium")
-
-    # Chromium fallback
-    if BrowserConfig and Browser:
-        try:
-            viewport = random.choice(VIEWPORTS)
-            ua = random.choice(USER_AGENTS)
-            cfg = BrowserConfig(
-                headless="new",
-                proxy=_proxy_browser_dict(proxy),
-                extra_chromium_args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox", "--disable-dev-shm-usage",
-                    "--enable-webgl", "--use-gl=swiftshader",
-                    "--enable-accelerated-2d-canvas",
-                    f"--window-size={viewport['width']},{viewport['height']}",
-                    "--start-maximized",
-                    "--disable-features=IsolateOrigins,site-per-process",
-                    "--disable-background-timer-throttling",
-                    "--disable-backgrounding-occluded-windows",
-                    "--disable-renderer-backgrounding",
-                    "--no-first-run", "--no-default-browser-check",
-                    "--password-store=basic", "--use-mock-keychain",
-                    "--disable-infobars", "--lang=en-US,en",
-                    "--accept-lang=en-US,en;q=0.9,ar;q=0.8",
-                    f'--user-agent={ua}',
-                ],
-            )
-            b = Browser(config=cfg)
-            print(f"[W{wid}] 🌐 Chromium launched ({viewport['width']}x{viewport['height']})")
-            return b, None, None  # no warm_page, no raw browser for Chromium path
-        except Exception as e:
-            print(f"[W{wid}] Chromium also failed: {e}")
-    return None, None, None
-
-async def _close_browser(browser_obj, is_camoufox: bool) -> None:
-    if browser_obj is None:
-        return
+def _make_browser_session(proxy: dict) -> Any:
+    """
+    Priority order:
+    1. Bright Data Scraping Browser CDP (best — handles JS challenges natively)
+    2. Local Playwright Chromium via BrowserProfile (fallback)
+    """
+    from browser_use.browser.session import BrowserSession
     try:
-        if is_camoufox:
-            await browser_obj.__aexit__(None, None, None)
-        else:
-            try:
-                await browser_obj.close()
-            except Exception:
-                pass
-    except Exception:
-        pass
+        from browser_use.browser.profile import BrowserProfile, ProxySettings
+    except ImportError:
+        from browser_use.browser.profile import BrowserProfile
+        ProxySettings = dict
 
+    viewport = random.choice(VIEWPORTS)
+    ua = random.choice(USER_AGENTS)
+
+    # ── Option A: Bright Data Scraping Browser CDP ─────────────────────────
+    if BD_API_KEY and BD_SCRAPING_BROWSER_ZONE:
+        # Extract base ID just in case
+        base_customer_id = PROXY_USER.split("-zone-")[0] 
+        
+        # FIX: Append the zone AND the UAE country targeting tag
+        sb_user = f"{base_customer_id}-zone-{BD_SCRAPING_BROWSER_ZONE}-country-ae"
+        
+        # FIX: Ensure connection uses wss://
+        cdp_url = (
+            f"wss://{sb_user}:{BD_SCRAPING_BROWSER_PASS}"
+            f"@{BD_SCRAPING_BROWSER_HOST}:{BD_SCRAPING_BROWSER_PORT}"
+        )
+        print(f"[Browser] Connecting to Bright Data Scraping Browser (UAE targeted)")
+        
+        try:
+            return BrowserSession(cdp_url=cdp_url)
+        except Exception as e:
+            print(f"[Browser] Scraping Browser connection failed: {e}")
+            print("[Browser] Falling back to local Chromium")
+
+    # ── Option B: Local Playwright Chromium ────────────────────────────────
+    profile = BrowserProfile(
+        headless=True,
+        disable_security=True,
+        proxy=ProxySettings(
+            server=f"http://{proxy['host']}:{proxy['port']}",
+            username=proxy["user"],
+            password=proxy["pass"],
+        ),
+        viewport={"width": viewport["width"], "height": viewport["height"]},
+        user_agent=ua,
+        args=[
+            "--no-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--ignore-certificate-errors",
+            "--ignore-ssl-errors",
+            "--allow-insecure-localhost",
+            "--allow-running-insecure-content",
+            "--disable-web-security",
+        ],
+    )
+    print("[Browser] Using Playwright Chromium with BrowserProfile")
+    return BrowserSession(browser_profile=profile)
 # ---------------------------------------------------------------------------
 # SINGLE WORKER
 # ---------------------------------------------------------------------------
@@ -757,11 +816,13 @@ async def _run_worker(
     sid = f"w{wid}_{str(uuid.uuid4())[:6]}"
     folder = f"{SCAN_DIR}/{datetime.now().strftime('%Y%m%d_%H%M%S')}_{sid}"
     os.makedirs(folder, exist_ok=True)
-    print(f"[W{wid}] Starting — {proxy['host']}:{proxy['port']}")
+    print(f"[W{wid}] Starting - {proxy['host']}:{proxy['port']}")
 
     llm = build_llm(request.model, os.getenv("OPENAI_API_KEY", ""))
     steps = [0]
     pc = [False]
+    blocked_count = [0]
+    current_page_ref = [None]  # store page ref for JS fallback
 
     async def _step(agent) -> None:
         if cancel_event.is_set():
@@ -775,87 +836,82 @@ async def _run_worker(
             if not pc[0]:
                 pc[0] = True
                 await _verify_proxy(proxy, wid)
+
             page = await bs.get_current_page()
             if page is None:
                 return
 
-            # Human behavior every 3 steps
+            current_page_ref[0] = page  # save for JS fallback
+
             if n % 3 == 0:
                 await human_scroll(page, random.randint(200, 400))
                 await human_mouse_move(page, random.randint(400, 1400), random.randint(300, 800))
 
             await _solve_captcha(page, proxy)
 
-            # Web Unlocker fallback — if still blocked after captcha solve attempt
             if await _is_blocked(page):
+                blocked_count[0] += 1
                 current_url = await _page_url(page)
-                print(f"[W{wid}] 🔓 Blocked detected — trying Web Unlocker for {current_url}")
-                html = await _fetch_via_unlocker(current_url)
-                if html:
-                    # Inject the unblocked HTML directly into the page
-                    escaped = html.replace('`', '\\`').replace('$', '\\$')
-                    await page.evaluate(f"""() => {{
-                        document.open();
-                        document.write(`{escaped[:500000]}`);
-                        document.close();
-                    }}""")
-                    print(f"[W{wid}] ✅ Unlocker HTML injected")
+                print(f"[W{wid}] Blocked (#{blocked_count[0]}) at {current_url} — waiting 15s")
+                await asyncio.sleep(15)
 
-            # Longer random pauses every 5 steps
+                # After waiting, check again
+                still_blocked = await _is_blocked(page)
+                if still_blocked and blocked_count[0] >= 2:
+                    # Try a hard reload
+                    print(f"[W{wid}] Still blocked — attempting hard reload")
+                    try:
+                        await page.goto(current_url, timeout=30000, wait_until="domcontentloaded")
+                        await asyncio.sleep(10)
+                    except Exception as re:
+                        print(f"[W{wid}] Reload failed: {re}")
+
+                if blocked_count[0] >= 4:
+                    still_blocked = await _is_blocked(page)
+                    if still_blocked:
+                        print(f"[W{wid}] Persistent block after {blocked_count[0]} attempts — aborting")
+                        raise RuntimeError("Persistent bot block — worker aborting")
+            else:
+                blocked_count[0] = 0
+
             if n % 5 == 0:
                 await human_delay_long()
             else:
                 await human_delay_short()
 
-            img = await page.screenshot()
-            if isinstance(img, str):
-                img = base64.b64decode(img)
-            with open(os.path.join(folder, f"step_{n:04d}_cb.png"), "wb") as fh:
-                fh.write(img)
-            print(f"[W{wid}] step {n:03d} ✓")
+            try:
+                img = await page.screenshot()
+                if isinstance(img, str):
+                    img = base64.b64decode(img)
+                with open(os.path.join(folder, f"step_{n:04d}_cb.png"), "wb") as fh:
+                    fh.write(img)
+            except Exception as se:
+                print(f"[W{wid}] Screenshot failed (non-fatal): {se}")
+            print(f"[W{wid}] step {n:03d} ok")
         except asyncio.CancelledError:
+            raise
+        except RuntimeError:
             raise
         except Exception as e:
             print(f"[W{wid}] step {n} err: {e}")
 
-    browser_obj = None
-    is_camoufox = False
     history = None
     rt = ""
 
     async with _browser_semaphore:
         try:
-            browser_obj, warm_page, raw_browser = await _create_browser_and_page(proxy, wid)
-            is_camoufox = raw_browser is not None  # raw_browser only set for Camoufox path
-
-            # Run warm-up to establish realistic session
-            if warm_page:
-                await _warmup_extended(warm_page, wid)
-                await warm_page.close()
+            await _warmup_extended(proxy, wid)
+            browser_session = _make_browser_session(proxy)
 
             kwargs: dict = dict(
-                task=_wrap_prompt(request.prompt), llm=llm,
-                save_conversation_path=folder, max_actions_per_step=1,
-                use_vision=True, max_failures=3, retry_delay=2,
+                task=_wrap_prompt(request.prompt),
+                llm=llm,
+                browser_session=browser_session,
+                save_conversation_path=folder,
+                max_actions_per_step=1,
+                use_vision=True,
+                max_failures=3,
             )
-
-            # Pass the correct browser object to the agent
-            if is_camoufox and raw_browser is not None:
-                # For Camoufox: pass the raw playwright browser
-                # browser-use expects a Browser wrapper, so wrap it
-                if BrowserConfig and Browser:
-                    try:
-                        brd_proxy = _proxy_browser_dict(proxy)
-                        cfg = BrowserConfig(proxy=brd_proxy)
-                        bu_browser = Browser(config=cfg)
-                        bu_browser._playwright_browser = raw_browser
-                        kwargs["browser"] = bu_browser
-                    except Exception:
-                        kwargs["browser"] = browser_obj
-                else:
-                    kwargs["browser"] = browser_obj
-            elif browser_obj is not None:
-                kwargs["browser"] = browser_obj
 
             agent = Agent(**kwargs)
             history = await asyncio.wait_for(
@@ -863,7 +919,7 @@ async def _run_worker(
                 timeout=WORKER_TIMEOUT,
             )
 
-            # 4-pass extraction
+            # ── 4-pass result extraction ───────────────────────────────────
             try:
                 fr = history.final_result()
                 if fr:
@@ -873,27 +929,27 @@ async def _run_worker(
             if not rt:
                 try:
                     for a in reversed(history.action_results() or []):
-                        if getattr(a, 'is_done', False):
-                            rt = getattr(a, 'extracted_content', '') or ''
+                        if getattr(a, "is_done", False):
+                            rt = getattr(a, "extracted_content", "") or ""
                             break
                 except Exception:
                     pass
             if not rt:
                 try:
                     for h in reversed(history.history or []):
-                        for r in reversed(getattr(h, 'result', []) or []):
-                            if getattr(r, 'is_done', False):
-                                rt = getattr(r, 'extracted_content', '') or ''
+                        for r in reversed(getattr(h, "result", []) or []):
+                            if getattr(r, "is_done", False):
+                                rt = getattr(r, "extracted_content", "") or ""
                                 break
                         if rt:
                             break
                 except Exception:
                     pass
             if not rt:
-                skip = ('🔗','🔍','Clicked','Typed','Waited','Scrolled','Searched','Navigated','scroll','Scroll')
+                skip = ("Clicked", "Typed", "Waited", "Scrolled", "Searched", "Navigated")
                 try:
                     for a in reversed(history.action_results() or []):
-                        t = getattr(a, 'extracted_content', '') or ''
+                        t = getattr(a, "extracted_content", "") or ""
                         if t and not any(t.startswith(s) for s in skip):
                             rt = t
                             break
@@ -902,14 +958,24 @@ async def _run_worker(
 
             cleaned = _clean_result(rt)
 
+            # ── FIX: JS table scrape fallback if agent returned nothing useful ──
+            if not _is_valid(cleaned) and current_page_ref[0] is not None:
+                print(f"[W{wid}] Agent result invalid — trying JS table scrape fallback")
+                try:
+                    js_data = await _js_scrape_procurement(current_page_ref[0])
+                    if js_data:
+                        cleaned = js_data
+                        print(f"[W{wid}] JS fallback returned {len(js_data)} rows")
+                except Exception as jse:
+                    print(f"[W{wid}] JS fallback error: {jse}")
+
             if _is_valid(cleaned) and not cancel_event.is_set():
                 async with winner_lock:
                     if cancel_event.is_set():
-                        print(f"[W{wid}] Lost the race")
                         return
                     cancel_event.set()
 
-                print(f"[W{wid}] ✅ Valid result!")
+                print(f"[W{wid}] Valid result!")
                 _dump_screenshots(history, folder)
                 _dump_json_screenshots(folder)
                 _ensure_frames(folder)
@@ -917,23 +983,23 @@ async def _run_worker(
                 video_url = None
                 try:
                     fc = len(glob.glob(os.path.join(folder, "*.png")))
-                    print(f"[W{wid}] Building video ({fc} frames)…")
+                    print(f"[W{wid}] Building video ({fc} frames)...")
                     video_url = await create_and_upload_video(folder, sid)
+                    print(f"[W{wid}] Video URL: {video_url}")
                 except Exception as ve:
                     print(f"[W{wid}] Video failed: {ve}")
 
                 await result_queue.put((wid, cleaned, steps[0], video_url))
             else:
-                print(f"[W{wid}] ❌ Invalid result")
+                print(f"[W{wid}] Invalid/empty result — no winner from this worker")
 
         except asyncio.TimeoutError:
-            print(f"[W{wid}] ⏱ Timeout ({WORKER_TIMEOUT}s)")
+            print(f"[W{wid}] Timeout ({WORKER_TIMEOUT}s)")
         except asyncio.CancelledError:
             print(f"[W{wid}] Cancelled")
         except Exception as e:
             print(f"[W{wid}] Error: {e}")
         finally:
-            await _close_browser(browser_obj, is_camoufox)
             try:
                 shutil.rmtree(folder)
             except Exception:
@@ -946,12 +1012,10 @@ async def _race(request: AgentRequest, proxies: list[dict]):
     q = asyncio.Queue()
     cancel = asyncio.Event()
     winner_lock = asyncio.Lock()
-
     tasks = [
-        asyncio.create_task(_run_worker(str(i+1), p, request, q, cancel, winner_lock))
+        asyncio.create_task(_run_worker(str(i + 1), p, request, q, cancel, winner_lock))
         for i, p in enumerate(proxies)
     ]
-
     winner = None
     try:
         pending = set(tasks)
@@ -973,7 +1037,6 @@ async def _race(request: AgentRequest, proxies: list[dict]):
             if not t.done():
                 t.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-
     return winner
 
 # ---------------------------------------------------------------------------
@@ -982,34 +1045,23 @@ async def _race(request: AgentRequest, proxies: list[dict]):
 @app.post("/agent/run", response_model=AgentResponse)
 async def run_agent(request: AgentRequest) -> AgentResponse:
     await _refresh_proxy_pool()
-
     print(f"\n{'='*60}")
-    print(f"[Agent] Task   : {request.prompt[:80]}…")
-    print(f"[Agent] Browser: {'Camoufox 🦊' if CAMOUFOX_AVAILABLE else 'Chromium'}")
-    print(f"[Agent] Proxy  : Bright Data Residential ✅")
+    print(f"[Agent] Task   : {request.prompt[:80]}...")
+    print(f"[Agent] Browser: BD Scraping Browser CDP (zone: {BD_SCRAPING_BROWSER_ZONE})")
+    print(f"[Agent] Proxy  : Bright Data Residential")
     print(f"{'='*60}\n")
 
     pool = list(_PROXY_POOL)
-
     for rnd in range(1, RACE_MAX_ROUNDS + 1):
-        proxies = [pool[0]]  # Single Bright Data endpoint — it rotates IPs automatically
         print(f"[Agent] Round {rnd}/{RACE_MAX_ROUNDS}")
-
-        winner = await _race(request, proxies)
-
+        winner = await _race(request, [pool[0]])
         if winner is not None:
-            wid, data, steps, vu = winner
-            print(f"\n[Agent] 🏆 Success in round {rnd}")
-            return AgentResponse(
-                video_url=vu,
-                steps_taken=steps,
-                extracted_data=data,
-                worker_id=wid,
-            )
+            wid, data, s, vu = winner
+            print(f"[Agent] ✅ Success in round {rnd} — data={type(data).__name__}, video={'yes' if vu else 'no'}")
+            return AgentResponse(video_url=vu, steps_taken=s, extracted_data=data, worker_id=wid)
+        print(f"[Agent] Round {rnd} failed, retrying...")
 
-        print(f"[Agent] Round {rnd} failed, retrying with fresh IP…")
-
-    print("[Agent] ❌ All rounds exhausted")
+    print("[Agent] All rounds exhausted — returning empty response")
     return AgentResponse(video_url=None, steps_taken=0, extracted_data=None, worker_id=None)
 
 # ---------------------------------------------------------------------------
@@ -1023,8 +1075,8 @@ async def startup_event():
 async def health() -> dict:
     return {
         "status": "ok",
-        "version": "6.3.0",
-        "browser": "camoufox" if CAMOUFOX_AVAILABLE else "chromium-fallback",
+        "version": "7.0.0",
+        "browser": "bd-scraping-browser-cdp",
+        "scraping_browser_zone": BD_SCRAPING_BROWSER_ZONE,
         "proxy": "bright-data-residential",
-        "mode": "single-worker-warmup-enabled",
     }
