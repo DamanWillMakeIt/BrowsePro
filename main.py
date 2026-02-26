@@ -539,7 +539,7 @@ def _dump_history_screenshots(history, folder: str) -> int:
             return False
 
     try:
-        for i, result in enumerate(getattr(history, "all_results", []) or []):
+        for i, result in enumerate((history.action_results() if history else None) or []):
             for attr in ("screenshot", "base64_screenshot", "image", "screenshot_b64"):
                 if _save(getattr(result, attr, None), f"step_{i+1:04d}_result"):
                     break
@@ -875,39 +875,62 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
     try:
         history     = await agent.run(max_steps=request.max_steps, on_step_end=on_step_end)
         result_text = ""
+
+        # ── Pass 1: history.final_result() — the canonical browser-use 0.11.x API ──
         try:
-            all_results = history.all_results or []
-            for action in reversed(all_results):
-                if getattr(action, 'is_done', False):
-                    raw = getattr(action, 'extracted_content', '') or ''
-                    if raw:
-                        result_text = raw
+            fr = history.final_result()
+            if fr:
+                result_text = fr
+                print(f"[Agent] Pass 1 (final_result): got {len(result_text)} chars")
+        except Exception as exc:
+            print(f"[Agent] Pass 1 failed: {exc}")
+
+        # ── Pass 2: walk history.action_results() for is_done entries ────────────
+        if not result_text:
+            try:
+                for action in reversed(history.action_results() or []):
+                    if getattr(action, 'is_done', False):
+                        raw = getattr(action, 'extracted_content', '') or ''
+                        if raw:
+                            result_text = raw
+                            print(f"[Agent] Pass 2 (action_results is_done): got {len(result_text)} chars")
                         break
-            if not result_text:
-                for out in reversed(history.all_model_outputs or []):
-                    done_block = out.get('done', {}) if isinstance(out, dict) else {}
-                    if done_block.get('text'):
-                        result_text = done_block['text']
+            except Exception as exc:
+                print(f"[Agent] Pass 2 failed: {exc}")
+
+        # ── Pass 3: walk history.history[].result for is_done entries ────────────
+        if not result_text:
+            try:
+                for h in reversed(history.history or []):
+                    for r in reversed(getattr(h, 'result', []) or []):
+                        if getattr(r, 'is_done', False):
+                            raw = getattr(r, 'extracted_content', '') or ''
+                            if raw:
+                                result_text = raw
+                                print(f"[Agent] Pass 3 (history.result is_done): got {len(result_text)} chars")
+                            break
+                    if result_text:
                         break
-            if not result_text:
-                skip = ('🔗', '🔍', 'Clicked', 'Typed', 'Waited', 'Scrolled', 'Searched')
-                for action in reversed(all_results):
+            except Exception as exc:
+                print(f"[Agent] Pass 3 failed: {exc}")
+
+        # ── Pass 4: any non-navigation extracted_content ─────────────────────────
+        if not result_text:
+            try:
+                skip = ('🔗', '🔍', 'Clicked', 'Typed', 'Waited', 'Scrolled',
+                        'Searched', 'Navigated', 'scroll', 'Scroll')
+                for action in reversed(history.action_results() or []):
                     text = getattr(action, 'extracted_content', '') or ''
                     if text and not any(text.startswith(s) for s in skip):
                         result_text = text
+                        print(f"[Agent] Pass 4 (any extracted_content): got {len(result_text)} chars")
                         break
-        except Exception:
-            result_text = ""
+            except Exception as exc:
+                print(f"[Agent] Pass 4 failed: {exc}")
 
+        print(f"[Agent] result_text length before clean: {len(result_text)}")
         if result_text:
-            json_match = _re.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', result_text, _re.DOTALL)
-            if json_match:
-                try:
-                    parsed      = json.loads(json_match.group(1))
-                    result_text = json.dumps(parsed, ensure_ascii=False, indent=2)
-                    print("[Agent] Extracted clean JSON ✅")
-                except Exception:
-                    pass
+            print(f"[Agent] result_text preview: {result_text[:200]!r}")
 
         print(f"[Agent] ✅ Completed in {step_counter[0]} steps")
 
@@ -929,7 +952,7 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
     _dump_json_screenshots(folder_name)
 
     steps_taken = step_counter[0] or (
-        len(getattr(history, "all_results", []) or []) if history else 0
+        len((history.action_results() if history else None) or []) if history else 0
     )
 
     _ensure_minimum_frames(folder_name)
@@ -945,10 +968,15 @@ async def run_agent(request: AgentRequest) -> AgentResponse:
     except Exception as exc:
         print(f"[Cleanup] Could not delete: {exc}")
 
+    cleaned = _clean_result(result_text)
+    # Explicit check — `or None` would wrongly discard valid falsy values
+    extracted = cleaned if cleaned not in (None, "", [], {}) else None
+    print(f"[Agent] extracted_data type={type(extracted).__name__}, preview={str(extracted)[:120] if extracted is not None else 'None'}")
+
     return AgentResponse(
         video_url=video_url,
         steps_taken=steps_taken,
-        extracted_data=_clean_result(result_text) or None,
+        extracted_data=extracted,
     )
 
 
